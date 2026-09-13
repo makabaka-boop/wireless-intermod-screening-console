@@ -63,8 +63,147 @@ textarea {
   resize: vertical;
 }
 
-textarea:focus {
+textarea:focus,
+input:focus {
   outline: 2px solid var(--accent);
+}
+
+input {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 14px;
+  padding: 10px 12px;
+}
+
+.input-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 2fr 1fr;
+}
+
+@media (max-width: 720px) {
+  .input-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.candidate-box {
+  background: rgba(77, 163, 255, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+}
+
+.candidate-box h2 {
+  font-size: 14px;
+  margin: 2px 0 4px;
+}
+
+.candidate-box .hint {
+  margin: 2px 0 0;
+}
+
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  margin-top: 4px;
+}
+
+.candidate-error-panel h2 {
+  font-size: 14px;
+}
+
+.candidate-verdict {
+  border-radius: 8px;
+  margin: 12px 0;
+  padding: 10px 14px;
+}
+
+.candidate-verdict h3 {
+  font-size: 15px;
+  margin: 2px 0 6px;
+}
+
+.candidate-verdict p {
+  font-size: 13px;
+  line-height: 1.8;
+  margin: 0;
+}
+
+.candidate-safe {
+  background: rgba(74, 222, 128, 0.08);
+  border: 1px solid var(--safe);
+}
+
+.candidate-risky {
+  background: rgba(255, 107, 107, 0.08);
+  border: 1px solid var(--danger);
+}
+
+.affected {
+  background: rgba(255, 107, 107, 0.15);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  display: inline-block;
+  margin: 0 4px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.affected-candidate {
+  font-weight: 700;
+}
+
+.new-conflicts {
+  border-top: 2px solid var(--danger);
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.new-conflicts h3 {
+  font-size: 15px;
+  margin: 8px 0;
+}
+
+.new-conflicts h4 {
+  font-size: 14px;
+  margin: 4px 0 8px;
+}
+
+.tag {
+  border-radius: 6px;
+  display: inline-block;
+  font-size: 12px;
+  font-style: normal;
+  margin: 0 4px;
+  padding: 1px 8px;
+}
+
+.tag-candidate {
+  background: rgba(255, 107, 107, 0.2);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+.source-new {
+  background: rgba(255, 107, 107, 0.22);
+  border: 1px solid var(--danger);
+  font-weight: 700;
+}
+
+.new-badge {
+  color: var(--danger);
+  font-size: 11px;
+  font-style: normal;
+  margin-left: 4px;
 }
 
 button {

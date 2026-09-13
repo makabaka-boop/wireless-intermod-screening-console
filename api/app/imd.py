@@ -10,6 +10,13 @@
 5. 相同「产物 + 目标频道」只展示一次，但列全所有来源组合；
    每个来源组合内部按频道名称排序，组合之间也按名称排序；
 6. 总结果依次按 目标频率 → 产物频率 → 目标名称 排序。
+
+候选试加（彩排临时借话筒）：
+``evaluate_candidate`` 复用上面的频道解析、整数 kHz 换算与冲突排序，
+对「基线清单」与「基线 + 候选」各分析一次，并以
+（目标频道，产物频率，来源组合）构成的稳定键比较两次结果，
+单独标出候选加入后才出现的冲突及受影响频道。候选本身的输入错误
+使用 :data:`CANDIDATE_LINE`（0）作为行号，与清单正文的行号区分。
 """
 
 from __future__ import annotations
@@ -23,6 +30,12 @@ GUARD_KHZ = 50  # 保护带：差值 ≤ 50 kHz（含恰好 50 kHz）即冲突
 MIN_CHANNELS = 2
 MAX_CHANNELS = 32
 
+# 候选输入区错误的固定行号（清单正文行号从 1 开始，0 专指候选区）
+CANDIDATE_LINE = 0
+
+# 名称中不允许出现的分隔字符：空白、英文逗号、中文逗号（与清单两列分隔口径一致）
+NAME_SEPARATOR_PATTERN = re.compile(r"[\s,，]")
+
 # 最多三位小数的 MHz 数值，如 500、500.1、500.125
 FREQ_PATTERN = re.compile(r"^\d{1,4}(?:\.\d{1,3})?$")
 
@@ -31,12 +44,12 @@ FREQ_PATTERN = re.compile(r"^\d{1,4}(?:\.\d{1,3})?$")
 class Channel:
     name: str
     freq_khz: int
-    line: int  # 输入文本中的行号（从 1 开始）
+    line: int  # 输入文本中的行号（从 1 开始）；候选频道固定为 CANDIDATE_LINE
 
 
 @dataclass(frozen=True)
 class InputError:
-    line: int  # 出错行号（从 1 开始）
+    line: int  # 出错行号（从 1 开始）；候选区错误固定为 CANDIDATE_LINE
     message: str
 
 
@@ -208,3 +221,170 @@ def build_summary(channels: list[Channel], conflicts: list[Conflict]) -> str:
                 f"差值 {c.diff_khz} kHz，来源：{sources}"
             )
     return "\n".join(lines)
+
+
+@dataclass
+class NewConflict:
+    """候选加入后才出现的冲突条目。
+
+    ``sources`` 为合并结果中该「目标 + 产物」的全部来源组合；
+    ``new_sources`` 为相对基线新增的来源组合（必然全部含候选）。
+    当基线本无该「目标 + 产物」时二者相同。
+    """
+
+    target_name: str
+    target_freq_khz: int
+    product_khz: int
+    diff_khz: int
+    sources: list[tuple[str, str]]
+    new_sources: list[tuple[str, str]]
+    target_is_candidate: bool  # 受影响的目标频道是否就是候选自身
+
+
+@dataclass
+class CandidateEvaluation:
+    """候选频道的试加评估结果。"""
+
+    name: str
+    freq_khz: int
+    merged_channel_count: int
+    baseline_conflicts: list[Conflict]  # 基线清单的完整冲突分组
+    # 合并候选后的完整冲突列表（排序口径与 analyze 一致）
+    merged_conflicts: list[Conflict]
+    # 候选加入后才出现的冲突，沿用 目标频率 → 产物频率 → 目标名称 排序
+    new_conflicts: list[NewConflict]
+    affected_channel_names: list[str]  # 新增冲突涉及的全部受影响频道（按名排序去重）
+
+    @property
+    def status(self) -> str:
+        """safe：无增量冲突；risky：候选为自身或既有频道引入了冲突。"""
+        return "safe" if not self.new_conflicts else "risky"
+
+    @property
+    def baseline_conflict_count(self) -> int:
+        return len(self.baseline_conflicts)
+
+
+def parse_candidate(
+    name: object, freq: object, channels: list[Channel]
+) -> tuple[Channel | None, list[InputError]]:
+    """校验候选名称/频率（复用整数 kHz 换算与范围口径）。
+
+    候选不参与清单解析，错误固定指向候选输入区（:data:`CANDIDATE_LINE`）。
+    ``channels`` 为已成功解析的基线频道，用于名称/频率重复与合并数量校验。
+    """
+    errors: list[InputError] = []
+
+    if not isinstance(name, str) or not name.strip():
+        errors.append(InputError(CANDIDATE_LINE, "候选名称缺失：请在候选输入区填写频道名称"))
+        name = ""
+    else:
+        name = name.strip()
+        if NAME_SEPARATOR_PATTERN.search(name):
+            errors.append(
+                InputError(
+                    CANDIDATE_LINE,
+                    "候选名称「%s」非法：名称不得包含空白或逗号" % name,
+                )
+            )
+        elif any(c.name == name for c in channels):
+            errors.append(
+                InputError(
+                    CANDIDATE_LINE,
+                    f"候选名称「{name}」与清单中的现有频道重复，请换一个名称",
+                )
+            )
+
+    if not isinstance(freq, str) or not freq.strip():
+        errors.append(InputError(CANDIDATE_LINE, "候选频率缺失：请在候选输入区填写频率(MHz)"))
+        freq_text = ""
+    else:
+        freq_text = freq.strip()
+        freq_khz = parse_freq_khz(freq_text)
+        if freq_khz is None:
+            errors.append(
+                InputError(
+                    CANDIDATE_LINE,
+                    f"候选频率「{freq_text}」非法：需为最多三位小数的 MHz 数值，例如 500.125",
+                )
+            )
+        elif not MIN_KHZ <= freq_khz <= MAX_KHZ:
+            errors.append(
+                InputError(
+                    CANDIDATE_LINE,
+                    f"候选频率 {format_mhz(freq_khz)} MHz 超出允许范围 "
+                    f"{format_mhz(MIN_KHZ)}–{format_mhz(MAX_KHZ)} MHz",
+                )
+            )
+        elif any(c.freq_khz == freq_khz for c in channels):
+            errors.append(
+                InputError(
+                    CANDIDATE_LINE,
+                    f"候选频率 {format_mhz(freq_khz)} MHz 与清单中的现有频道重复，"
+                    "频率必须互不重复",
+                )
+            )
+
+    if len(channels) >= MAX_CHANNELS:
+        errors.append(
+            InputError(
+                CANDIDATE_LINE,
+                f"清单已有 {len(channels)} 个频道，试加候选后将超过上限 {MAX_CHANNELS} 个",
+            )
+        )
+
+    if errors:
+        return None, errors
+    return Channel(name=name, freq_khz=freq_khz, line=CANDIDATE_LINE), []
+
+
+def _conflict_index(
+    conflicts: list[Conflict],
+) -> dict[tuple[str, int], Conflict]:
+    """以（目标频道名，产物 kHz）稳定键索引冲突。"""
+    return {(c.target_name, c.product_khz): c for c in conflicts}
+
+
+def evaluate_candidate(channels: list[Channel], candidate: Channel) -> CandidateEvaluation:
+    """比较基线与「基线 + 候选」两次分析，标出候选带来的增量冲突。
+
+    复用 :func:`analyze` 的整数运算、去重与排序口径；
+    以（目标频道，产物，来源组合）稳定键比较两次结果。
+    """
+    baseline = analyze(channels)
+    merged = analyze(channels + [candidate])
+    base_index = _conflict_index(baseline)
+
+    new_conflicts: list[NewConflict] = []
+    affected: set[str] = set()
+    for c in merged:
+        base = base_index.get((c.target_name, c.product_khz))
+        base_sources = set(base.sources) if base is not None else set()
+        new_sources = [pair for pair in c.sources if pair not in base_sources]
+        if not new_sources:
+            continue
+        new_conflicts.append(
+            NewConflict(
+                target_name=c.target_name,
+                target_freq_khz=c.target_freq_khz,
+                product_khz=c.product_khz,
+                diff_khz=c.diff_khz,
+                sources=list(c.sources),
+                new_sources=new_sources,
+                target_is_candidate=(c.target_name == candidate.name),
+            )
+        )
+        affected.add(c.target_name)
+
+    new_conflicts.sort(
+        key=lambda item: (item.target_freq_khz, item.product_khz, item.target_name)
+    )
+    return CandidateEvaluation(
+        name=candidate.name,
+        freq_khz=candidate.freq_khz,
+        merged_channel_count=len(channels) + 1,
+        baseline_conflicts=baseline,
+        merged_conflicts=merged,
+        new_conflicts=new_conflicts,
+        affected_channel_names=sorted(affected),
+    )

@@ -1,7 +1,13 @@
 import { useMemo, useState } from "react";
 import { analyze, InputError } from "./api";
 import { formatMhz } from "./format";
-import type { AnalyzeResponse, ConflictOut, ErrorItem } from "./types";
+import type {
+  AnalyzeResponse,
+  CandidateOut,
+  ConflictOut,
+  ErrorItem,
+  NewConflictOut,
+} from "./types";
 
 const EXAMPLE_INPUT = `# 每行一个频道：名称 频率(MHz)，470.000–694.000，最多三位小数
 A 500.000
@@ -9,10 +15,20 @@ B 500.100
 C 499.850
 D 500.250`;
 
+/** 候选区错误固定使用行号 0（清单正文行号从 1 开始） */
+const CANDIDATE_AREA_LINE = 0;
+
 interface ConflictGroup {
   targetName: string;
   targetFreqKhz: number;
   items: ConflictOut[];
+}
+
+interface NewConflictGroup {
+  targetName: string;
+  targetFreqKhz: number;
+  targetIsCandidate: boolean;
+  items: NewConflictOut[];
 }
 
 /** 冲突列表已按目标频率排序，按受影响频道分组展示 */
@@ -33,10 +49,36 @@ function groupByTarget(conflicts: ConflictOut[]): ConflictGroup[] {
   return groups;
 }
 
+/** 候选引入的新增冲突同样按受影响频道分组 */
+function groupNewByTarget(conflicts: NewConflictOut[]): NewConflictGroup[] {
+  const groups: NewConflictGroup[] = [];
+  for (const c of conflicts) {
+    const last = groups[groups.length - 1];
+    if (last && last.targetName === c.target_name) {
+      last.items.push(c);
+    } else {
+      groups.push({
+        targetName: c.target_name,
+        targetFreqKhz: c.target_freq_khz,
+        targetIsCandidate: c.target_is_candidate,
+        items: [c],
+      });
+    }
+  }
+  return groups;
+}
+
+function sourceKey(pair: [string, string]) {
+  return `${pair[0]} ${pair[1]}`;
+}
+
 export default function App() {
   const [text, setText] = useState(EXAMPLE_INPUT);
+  const [candidateName, setCandidateName] = useState("");
+  const [candidateFreq, setCandidateFreq] = useState("");
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [errors, setErrors] = useState<ErrorItem[]>([]);
+  const [candidateErrors, setCandidateErrors] = useState<ErrorItem[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -45,25 +87,51 @@ export default function App() {
     () => (result ? groupByTarget(result.conflicts) : []),
     [result],
   );
+  const newGroups = useMemo(
+    () => (result?.candidate ? groupNewByTarget(result.candidate.new_conflicts) : []),
+    [result],
+  );
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  async function runAnalyze(withCandidate: boolean) {
     setLoading(true);
-    setResult(null);
-    setErrors([]);
     setFatal(null);
     setCopied(false);
     try {
-      setResult(await analyze(text));
+      const data = await analyze(
+        text,
+        withCandidate ? { name: candidateName, freq: candidateFreq } : undefined,
+      );
+      setResult(data);
+      setErrors([]);
+      setCandidateErrors([]);
     } catch (err) {
       if (err instanceof InputError) {
-        setErrors(err.errors);
+        // 行号 0 专指候选输入区：错误只在候选区提示，且不覆盖上一次有效结果
+        const listErrors = err.errors.filter((e) => e.line !== CANDIDATE_AREA_LINE);
+        const areaErrors = err.errors.filter((e) => e.line === CANDIDATE_AREA_LINE);
+        if (listErrors.length > 0) {
+          setErrors(listErrors);
+          setCandidateErrors([]);
+          setResult(null); // 清单非法：整批拒绝，不展示任何风险结果
+        } else {
+          setCandidateErrors(areaErrors);
+          setErrors([]);
+        }
       } else {
         setFatal(err instanceof Error ? err.message : "未知错误");
       }
     } finally {
       setLoading(false);
     }
+  }
+
+  function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    void runAnalyze(false);
+  }
+
+  function onTryAdd() {
+    void runAnalyze(true);
   }
 
   async function copySummary() {
@@ -84,6 +152,8 @@ export default function App() {
     setCopied(true);
   }
 
+  const candidate: CandidateOut | undefined = result?.candidate;
+
   return (
     <main className="page">
       <header>
@@ -95,14 +165,50 @@ export default function App() {
       </header>
 
       <form onSubmit={onSubmit}>
-        <label htmlFor="channels">频道清单（每行：名称 频率，支持 # 注释）</label>
-        <textarea
-          id="channels"
-          rows={10}
-          spellCheck={false}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-        />
+        <div className="input-grid">
+          <div className="input-col">
+            <label htmlFor="channels">频道清单（每行：名称 频率，支持 # 注释）</label>
+            <textarea
+              id="channels"
+              rows={10}
+              spellCheck={false}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+            />
+          </div>
+          <aside className="candidate-box" aria-label="候选试加区">
+            <h2>候选话筒（仅试加，不写入正式清单）</h2>
+            <label htmlFor="candidate-name">候选名称</label>
+            <input
+              id="candidate-name"
+              type="text"
+              spellCheck={false}
+              autoComplete="off"
+              placeholder="例如 X"
+              value={candidateName}
+              onChange={(e) => setCandidateName(e.target.value)}
+            />
+            <label htmlFor="candidate-freq">候选频率（MHz，470.000–694.000）</label>
+            <input
+              id="candidate-freq"
+              type="text"
+              spellCheck={false}
+              autoComplete="off"
+              placeholder="例如 499.950"
+              value={candidateFreq}
+              onChange={(e) => setCandidateFreq(e.target.value)}
+            />
+            <button
+              type="button"
+              className="secondary"
+              disabled={loading}
+              onClick={onTryAdd}
+            >
+              {loading ? "试加评估中…" : "试加频道"}
+            </button>
+            <p className="hint">临时借入的话筒先试评估增量影响，再决定是否写入清单。</p>
+          </aside>
+        </div>
         <button type="submit" disabled={loading}>
           {loading ? "排查中…" : "提交排查"}
         </button>
@@ -129,6 +235,23 @@ export default function App() {
         </section>
       )}
 
+      {candidateErrors.length > 0 && (
+        <section className="panel error-panel candidate-error-panel" role="alert">
+          <h2>
+            候选输入有误（{candidateErrors.length} 项）
+            {result ? "，已保留上一次有效结果" : "，请修正后重试"}
+          </h2>
+          <ul className="error-list">
+            {candidateErrors.map((e, i) => (
+              <li key={i}>
+                <span className="line-badge">候选输入区</span>
+                {e.message}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {result && (
         <section className="panel">
           {result.conflict_count === 0 ? (
@@ -137,6 +260,52 @@ export default function App() {
             <h2 className="danger">
               发现 {result.conflict_count} 项冲突（共 {result.channel_count} 个频道）
             </h2>
+          )}
+
+          {candidate && (
+            <div
+              className={
+                candidate.status === "safe"
+                  ? "candidate-verdict candidate-safe"
+                  : "candidate-verdict candidate-risky"
+              }
+              role="status"
+            >
+              {candidate.status === "safe" ? (
+                <>
+                  <h3 className="safe">
+                    候选 {candidate.name}（{formatMhz(candidate.freq_khz)} MHz）试加安全：无增量冲突
+                  </h3>
+                  <p>
+                    合并后共 {candidate.merged_channel_count} 个频道、
+                    {candidate.merged_conflict_count} 项冲突，与基线清单一致，可考虑正式加入。
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h3 className="danger">
+                    候选 {candidate.name}（{formatMhz(candidate.freq_khz)} MHz）试加有风险：新增{" "}
+                    {candidate.new_conflict_count} 项冲突
+                  </h3>
+                  <p>
+                    基线 {candidate.baseline_conflict_count} 项 → 合并后{" "}
+                    {candidate.merged_conflict_count} 项（共 {candidate.merged_channel_count}{" "}
+                    个频道）；受影响频道：
+                    {candidate.affected_channel_names.map((n) => (
+                      <span
+                        className={
+                          n === candidate.name ? "affected affected-candidate" : "affected"
+                        }
+                        key={n}
+                      >
+                        {n}
+                        {n === candidate.name ? "（候选自身）" : ""}
+                      </span>
+                    ))}
+                  </p>
+                </>
+              )}
+            </div>
           )}
 
           {groups.map((g) => (
@@ -171,6 +340,59 @@ export default function App() {
               </table>
             </article>
           ))}
+
+          {candidate && candidate.status === "risky" && (
+            <article className="new-conflicts">
+              <h3 className="danger">候选加入后才出现的冲突（{newGroups.length} 个受影响频道）</h3>
+              {newGroups.map((g) => (
+                <div className="group" key={g.targetName}>
+                  <h4>
+                    受影响频道 {g.targetName}（{formatMhz(g.targetFreqKhz)} MHz）
+                    {g.targetIsCandidate && <span className="tag tag-candidate">候选自身</span>}
+                    {" — "}
+                    {g.items.length} 项新增
+                  </h4>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>互调产物</th>
+                        <th>差值</th>
+                        <th>来源组合（加粗为新增来源）</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {g.items.map((c) => {
+                        const newSourceKeys = new Set(c.new_sources.map(sourceKey));
+                        return (
+                          <tr key={c.product_khz}>
+                            <td>{formatMhz(c.product_khz)} MHz</td>
+                            <td>{c.diff_khz} kHz</td>
+                            <td>
+                              {c.sources.map((pair, i) => (
+                                <span
+                                  className={
+                                    newSourceKeys.has(sourceKey(pair))
+                                      ? "source source-new"
+                                      : "source"
+                                  }
+                                  key={i}
+                                >
+                                  {pair[0]} + {pair[1]}
+                                  {newSourceKeys.has(sourceKey(pair)) && (
+                                    <em className="new-badge">新增</em>
+                                  )}
+                                </span>
+                              ))}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+            </article>
+          )}
 
           <div className="summary-header">
             <h3>可复制摘要</h3>

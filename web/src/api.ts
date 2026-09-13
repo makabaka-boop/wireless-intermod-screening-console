@@ -8,17 +8,29 @@ export class InputError extends Error {
   }
 }
 
+/** 彩排试加的候选频道；名称/频率在候选输入区单独填写 */
+export interface CandidateInput {
+  name: string;
+  freq: string;
+}
+
 /**
  * 提交频道清单进行互调排查。
  * 请求真实后端接口 /api/analyze（开发环境由 vite 代理，生产由 nginx 反代）。
+ * candidate 非空时携带候选对象，后端在保留基线结果的同时返回增量评估。
  */
-export async function analyze(input: string): Promise<AnalyzeResponse> {
+export async function analyze(
+  input: string,
+  candidate?: CandidateInput,
+): Promise<AnalyzeResponse> {
   let res: Response;
   try {
     res = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input }),
+      body: JSON.stringify(
+        candidate ? { input, candidate: { name: candidate.name, freq: candidate.freq } } : { input },
+      ),
     });
   } catch {
     throw new Error("无法连接 API 服务，请确认 api 容器已启动");

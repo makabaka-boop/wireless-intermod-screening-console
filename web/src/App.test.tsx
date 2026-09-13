@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { AnalyzeResponse } from "./types";
+import type { AnalyzeResponse, CandidateOut } from "./types";
 
 const CONFLICT_RESPONSE: AnalyzeResponse = {
   channel_count: 4,
@@ -70,6 +70,68 @@ function submitForm(input: string) {
   const textarea = screen.getByLabelText(/频道清单/);
   fireEvent.change(textarea, { target: { value: input } });
   fireEvent.click(screen.getByRole("button", { name: /提交排查/ }));
+}
+
+const RISKY_CANDIDATE: CandidateOut = {
+  name: "X",
+  freq_khz: 499_900,
+  status: "risky",
+  merged_channel_count: 5,
+  baseline_conflict_count: 4,
+  merged_conflict_count: 9,
+  new_conflict_count: 6,
+  affected_channel_names: ["A", "B", "C", "D", "X"],
+  new_conflicts: [
+    {
+      target_name: "C",
+      target_freq_khz: 499_850,
+      product_khz: 499_800,
+      diff_khz: 50,
+      sources: [["A", "X"]],
+      new_sources: [["A", "X"]],
+      target_is_candidate: false,
+    },
+    {
+      target_name: "X",
+      target_freq_khz: 499_900,
+      product_khz: 499_900,
+      diff_khz: 0,
+      sources: [["A", "B"]],
+      new_sources: [["A", "B"]],
+      target_is_candidate: true,
+    },
+    {
+      target_name: "A",
+      target_freq_khz: 500_000,
+      product_khz: 499_950,
+      diff_khz: 50,
+      sources: [["B", "D"], ["C", "X"]],
+      new_sources: [["C", "X"]],
+      target_is_candidate: false,
+    },
+  ],
+};
+
+const RISKY_RESPONSE: AnalyzeResponse = {
+  ...CONFLICT_RESPONSE,
+  candidate: RISKY_CANDIDATE,
+};
+
+const SAFE_CANDIDATE: CandidateOut = {
+  name: "X",
+  freq_khz: 470_100,
+  status: "safe",
+  merged_channel_count: 6,
+  baseline_conflict_count: 0,
+  merged_conflict_count: 0,
+  new_conflict_count: 0,
+  affected_channel_names: [],
+  new_conflicts: [],
+};
+
+function fillCandidate(name: string, freq: string) {
+  fireEvent.change(screen.getByLabelText(/候选名称/), { target: { value: name } });
+  fireEvent.change(screen.getByLabelText(/候选频率/), { target: { value: freq } });
 }
 
 beforeEach(() => {
@@ -172,5 +234,161 @@ describe("页面提交", () => {
     await userEvent.click(screen.getByRole("button", { name: "复制摘要" }));
     expect(writeText).toHaveBeenCalledWith(SAFE_RESPONSE.summary);
     expect(await screen.findByText("已复制 ✓")).toBeInTheDocument();
+  });
+});
+
+describe("候选试加", () => {
+  it("点击试加频道携带 candidate 调用接口，展示风险判定、候选自身与受影响既有频道", async () => {
+    const fetchMock = mockFetch(200, RISKY_RESPONSE);
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText(/频道清单/), {
+      target: { value: "A 500.000\nB 500.100\nC 499.850\nD 500.250" },
+    });
+    fillCandidate("X", "499.900");
+    fireEvent.click(screen.getByRole("button", { name: /试加频道/ }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/analyze");
+    expect(JSON.parse(init.body)).toEqual({
+      input: "A 500.000\nB 500.100\nC 499.850\nD 500.250",
+      candidate: { name: "X", freq: "499.900" },
+    });
+
+    // 风险判定横幅与计数
+    expect(await screen.findByText(/试加有风险：新增 6 项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/基线 4 项 → 合并后 9 项/)).toBeInTheDocument();
+    // 受影响频道：候选自身与既有频道都标出
+    expect(screen.getByText("X（候选自身）")).toBeInTheDocument();
+    expect(screen.getByText("候选自身")).toBeInTheDocument(); // 分组徽标
+
+    // 原有完整冲突分组仍然保留（新增分区中也可能出现同名受影响频道）
+    expect(
+      screen.getAllByText(/受影响频道 C（499\.850 MHz）/).length,
+    ).toBeGreaterThan(0);
+
+    // 候选加入后才出现的冲突分区
+    expect(screen.getByText(/候选加入后才出现的冲突（3 个受影响频道）/)).toBeInTheDocument();
+    // 既有目标+产物新增来源：C + X 标为新增，旧来源 B + D 仍展示
+    expect(screen.getAllByText("499.950 MHz").length).toBeGreaterThan(0);
+    expect(screen.getByText("C + X")).toBeInTheDocument();
+    expect(screen.getAllByText("B + D").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("新增").length).toBeGreaterThan(0);
+  });
+
+  it("安全候选显示无增量且不出现新增冲突分区", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetch(200, {
+        ...SAFE_RESPONSE,
+        channel_count: 5,
+        channels: [
+          { name: "C1", freq_khz: 500_000, line: 1 },
+          { name: "C2", freq_khz: 510_000, line: 2 },
+          { name: "C3", freq_khz: 530_000, line: 3 },
+          { name: "C4", freq_khz: 580_000, line: 4 },
+          { name: "C5", freq_khz: 600_000, line: 5 },
+        ],
+        candidate: SAFE_CANDIDATE,
+      }),
+    );
+    render(<App />);
+
+    fillCandidate("X", "470.100");
+    fireEvent.click(screen.getByRole("button", { name: /试加频道/ }));
+
+    expect(
+      await screen.findByText(/候选 X（470\.100 MHz）试加安全：无增量冲突/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/候选加入后才出现的冲突/)).not.toBeInTheDocument();
+  });
+
+  it("候选重复/越界时错误指向候选输入区，且不覆盖上一次有效结果", async () => {
+    const fetchMock = vi
+      .fn()
+      // 第一次：正常试加，拿到有效结果
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RISKY_RESPONSE,
+      })
+      // 第二次：候选名称与清单重复，line=0
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [{ line: 0, message: "候选名称「A」与清单中的现有频道重复，请换一个名称" }],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fillCandidate("X", "499.900");
+    fireEvent.click(screen.getByRole("button", { name: /试加频道/ }));
+    await screen.findByText(/试加有风险：新增 6 项冲突/);
+
+    // 改用重复名称再次试加
+    fireEvent.change(screen.getByLabelText(/候选名称/), { target: { value: "A" } });
+    fireEvent.click(screen.getByRole("button", { name: /试加频道/ }));
+
+    expect(await screen.findByText(/候选输入有误（1 项），已保留上一次有效结果/)).toBeInTheDocument();
+    expect(screen.getByText("候选输入区")).toBeInTheDocument();
+    expect(screen.getByText(/候选名称「A」与清单中的现有频道重复/)).toBeInTheDocument();
+    // 上一次有效结果仍在
+    expect(screen.getByText(/试加有风险：新增 6 项冲突/)).toBeInTheDocument();
+    // 不混入清单错误面板
+    expect(screen.queryByText(/^第 0 行$/)).not.toBeInTheDocument();
+  });
+
+  it("清单非法时仍按原行号整批拒绝并清空风险结果，即使点的是试加", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetch(422, {
+        errors: [{ line: 1, message: "频率「500.0005」非法：需为最多三位小数的 MHz 数值" }],
+      }),
+    );
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText(/频道清单/), { target: { value: "CH1 500.0005" } });
+    fillCandidate("X", "499.900");
+    fireEvent.click(screen.getByRole("button", { name: /试加频道/ }));
+
+    expect(await screen.findByText(/输入有误（1 项）/)).toBeInTheDocument();
+    expect(screen.getByText("第 1 行")).toBeInTheDocument();
+    expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/候选输入有误/)).not.toBeInTheDocument();
+  });
+
+  it("提交排查（无候选）不携带 candidate 字段，且会清走上一次候选评估", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RISKY_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => SAFE_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    fillCandidate("X", "499.900");
+    fireEvent.click(screen.getByRole("button", { name: /试加频道/ }));
+    await screen.findByText(/试加有风险/);
+
+    fireEvent.change(screen.getByLabelText(/频道清单/), {
+      target: { value: "C1 500.000\nC2 510.000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /提交排查/ }));
+
+    await screen.findByText(/安全清单：零项冲突/);
+    const [, init2] = fetchMock.mock.calls[1];
+    expect(JSON.parse(init2.body)).toEqual({ input: "C1 500.000\nC2 510.000" });
+    expect(screen.queryByText(/试加有风险/)).not.toBeInTheDocument();
   });
 });
