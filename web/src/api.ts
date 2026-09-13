@@ -25,8 +25,13 @@ export async function analyze(input: string): Promise<AnalyzeResponse> {
   }
 
   if (res.status === 422) {
-    const data = (await res.json()) as { errors: ErrorItem[] };
-    throw new InputError(data.errors);
+    const data = await res.json().catch(() => null);
+    // 正常路径后端返回 { errors: [...] }；异常路径（如代理层 422）兜底给出第 1 行提示
+    const errors =
+      data && Array.isArray(data.errors) && data.errors.length > 0
+        ? (data.errors as ErrorItem[])
+        : [{ line: 1, message: "提交内容缺失或格式错误：请检查频道清单后重试" }];
+    throw new InputError(errors);
   }
   if (!res.ok) {
     throw new Error(`服务器错误（HTTP ${res.status}）`);

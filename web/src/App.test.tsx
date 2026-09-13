@@ -131,6 +131,22 @@ describe("页面提交", () => {
     expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
   });
 
+  it("提交内容缺失时展示第 1 行提示而非技术错误", async () => {
+    // 后端对缺失 input 字段等技术性 422 也统一返回 errors 结构；
+    // 这里模拟异常路径（无 errors 字段），前端兜底仍须给出第 1 行提示
+    vi.stubGlobal(
+      "fetch",
+      mockFetch(422, { detail: [{ loc: ["body", "input"], msg: "Field required" }] }),
+    );
+    render(<App />);
+
+    submitForm("");
+
+    expect(await screen.findByText("第 1 行")).toBeInTheDocument();
+    expect(screen.getByText(/提交内容缺失或格式错误/)).toBeInTheDocument();
+    expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
+  });
+
   it("安全清单明确显示零项冲突", async () => {
     vi.stubGlobal("fetch", mockFetch(200, SAFE_RESPONSE));
     render(<App />);

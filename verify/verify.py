@@ -127,6 +127,22 @@ def main() -> int:
         expect([e["line"] for e in errors] == [1, 2, 3], f"错误行号不符: {errors}")
         expect(all(isinstance(e["line"], int) and e["line"] >= 1 for e in errors), "行号必须 ≥1")
 
+    def t_missing_content_line1_hint():
+        resp = httpx.post(f"{API}/api/analyze", json={}, timeout=10)
+        expect(resp.status_code == 422, f"缺失 input 字段应返回 422，实际 {resp.status_code}")
+        data = resp.json()
+        expect("conflicts" not in data, "不得给出部分风险结果")
+        errors = data.get("errors")
+        expect(bool(errors) and errors[0]["line"] == 1, f"应给出第 1 行提示: {data}")
+
+    def t_dotted_and_long_names_accepted():
+        long_name = "无线话筒." + "甲" * 40
+        resp = analyze(f"Mic.01 500.000\n{long_name} 510.000")
+        expect(resp.status_code == 200, f"带点号/超长名称不应被拒: HTTP {resp.status_code} {resp.text[:200]}")
+        data = resp.json()
+        expect(data["channel_count"] == 2, "应接受 2 个合法唯一频道")
+        expect(data["channels"][1]["name"] == long_name, "超长名称应原样保留")
+
     def t_dedup_and_ordering():
         resp = analyze("T 500.000\nA 500.100\nB 500.150\nC 500.200\nD 500.350")
         got = [
@@ -171,6 +187,8 @@ def main() -> int:
         ("频段边缘产物保留、带外产物剔除", t_band_edges),
         ("安全清单零项冲突", t_safe_list_zero),
         ("非法输入整批拒绝且错误带行号", t_invalid_rejected_with_line_numbers),
+        ("提交内容缺失返回第 1 行提示", t_missing_content_line1_hint),
+        ("带点号/超长名称的合法频道可排查", t_dotted_and_long_names_accepted),
         ("相同产物+目标去重并列全来源、结果排序", t_dedup_and_ordering),
         ("Web 页面可访问", t_web_page_served),
         ("Web /api 反代联调链路", t_web_proxy_to_api),

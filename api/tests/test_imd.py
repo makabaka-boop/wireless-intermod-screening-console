@@ -139,6 +139,18 @@ def test_parse_supports_comma_and_chinese_names():
     assert [c.name for c in channels] == ["话筒一", "话筒二"]
 
 
+def test_names_with_dots_and_long_names_accepted():
+    long_name = "无线话筒-东区." + "甲" * 40
+    channels = make(f"Mic.01 500.000\n{long_name} 510.000")
+    assert [c.name for c in channels] == ["Mic.01", long_name]
+
+
+def test_duplicate_dotted_name_rejected():
+    _, errors = parse_channels("Mic.1 500.000\nMic.1 510.000")
+    assert len(errors) == 1
+    assert errors[0].line == 2 and "唯一" in errors[0].message
+
+
 def test_error_more_than_three_decimals():
     _, errors = parse_channels("CH1 500.0005\nCH2 510.000")
     assert [(e.line, "三位小数" in e.message) for e in errors] == [(1, True)]

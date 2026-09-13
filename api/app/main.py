@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -27,6 +28,22 @@ app.add_middleware(
 
 class AnalyzeRequest(BaseModel):
     input: str = Field(..., description="频道清单文本，每行：名称 频率(MHz)")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_req: Request, _exc: RequestValidationError):
+    """请求体缺失或结构非法（如缺少 input 字段）时，仍按统一契约返回带行号的错误。"""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "errors": [
+                {
+                    "line": 1,
+                    "message": "提交内容缺失或格式错误：请求体应为 JSON，且包含 input 文本字段",
+                }
+            ]
+        },
+    )
 
 
 class ChannelOut(BaseModel):

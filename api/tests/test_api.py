@@ -85,6 +85,35 @@ def test_single_channel_rejected():
     assert resp.json()["errors"][0]["line"] == 1
 
 
+def test_missing_input_field_returns_line1_error():
+    resp = client.post("/api/analyze", json={})
+    assert resp.status_code == 422
+    data = resp.json()
+    assert "conflicts" not in data
+    errors = data["errors"]
+    assert errors[0]["line"] == 1
+    assert "提交内容缺失" in errors[0]["message"]
+
+
+def test_empty_input_returns_line1_error():
+    resp = client.post("/api/analyze", json={"input": "  \n# 只有注释\n"})
+    assert resp.status_code == 422
+    errors = resp.json()["errors"]
+    assert errors[0]["line"] == 1
+    assert "输入为空" in errors[0]["message"]
+
+
+def test_dotted_and_long_names_accepted():
+    long_name = "无线话筒." + "甲" * 40
+    resp = client.post(
+        "/api/analyze", json={"input": f"Mic.01 500.000\n{long_name} 510.000"}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["channel_count"] == 2
+    assert [c["name"] for c in data["channels"]] == ["Mic.01", long_name]
+
+
 def test_33_channels_rejected_at_line_33():
     text = "\n".join(f"CH{i} {470 + i}.000" for i in range(33))
     resp = client.post("/api/analyze", json={"input": text})

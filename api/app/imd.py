@@ -25,8 +25,6 @@ MAX_CHANNELS = 32
 
 # 最多三位小数的 MHz 数值，如 500、500.1、500.125
 FREQ_PATTERN = re.compile(r"^\d{1,4}(?:\.\d{1,3})?$")
-# 频道名称：字母/数字/下划线/连字符/中文，1–32 字符
-NAME_PATTERN = re.compile(r"^[\w\-]{1,32}$")
 
 
 @dataclass(frozen=True)
@@ -89,14 +87,8 @@ def parse_channels(text: str) -> tuple[list[Channel], list[InputError]]:
             continue
         name, freq_text = parts
 
-        if not NAME_PATTERN.match(name):
-            errors.append(
-                InputError(
-                    lineno,
-                    f"频道名称「{name}」非法：仅允许字母、数字、下划线、连字符或中文，1–32 字符",
-                )
-            )
-        elif name in seen_names:
+        # 名称可为任意非空白文本（可含点号、长度不限），唯一性是唯一约束
+        if name in seen_names:
             errors.append(
                 InputError(
                     lineno,
