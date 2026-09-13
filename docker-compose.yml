@@ -1,0 +1,43 @@
+# 无线话筒三阶互调排查台
+# 用法：docker compose up --build
+# 宿主端口可用环境变量覆盖：WEB_PORT=9000 API_PORT=9001 docker compose up --build
+services:
+  api:
+    build: ./api
+    image: imd-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health').read()",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  web:
+    build: ./web
+    image: imd-web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+
+  # 一次性验收服务：跑完自动退出，退出码 0 表示验收通过
+  verify:
+    build: ./verify
+    image: imd-verify
+    environment:
+      API_BASE: http://api:8000
+      WEB_BASE: http://web
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: "no"

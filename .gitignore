@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+
+# Node
+node_modules/
+dist/
+
+# 系统
+.DS_Store
