@@ -102,7 +102,10 @@ export default function App() {
     [result],
   );
 
-  async function runAnalyze(mode: "list" | "candidate" | "retune" | "focus") {
+  async function runAnalyze(
+    mode: "list" | "candidate" | "retune" | "focus" | "apply",
+    applyReq?: { name: string; freqKhz: number; manifestVersion: string },
+  ) {
     setLoading(true);
     setFatal(null);
     setCopied(false);
@@ -112,23 +115,55 @@ export default function App() {
         mode === "candidate" ? { name: candidateName, freq: candidateFreq } : undefined,
         mode === "retune" ? retuneTarget : undefined,
         mode === "focus" ? focusNames : undefined,
+        mode === "apply" && applyReq
+          ? {
+              name: applyReq.name,
+              freqKhz: applyReq.freqKhz,
+              manifestVersion: applyReq.manifestVersion,
+            }
+          : undefined,
       );
       setResult(data);
       setErrors([]);
       setCandidateErrors([]);
       setRetuneErrors([]);
       setFocusErrors([]);
+      // 应用成功：用服务端只替换目标行后的文本同步编辑区（注释/空白原样保留），
+      // 完整冲突分组与摘要已随返回结果更新
+      if (mode === "apply" && data.applied) {
+        setText(data.applied.applied_text);
+        setRetuneTarget("");
+      }
       // 重点频道勾选项随最新有效结果收敛，避免残留已不在清单中的不可见勾选
       const validNames = new Set(data.channels.map((c) => c.name));
       setFocusNames((prev) => prev.filter((n) => validNames.has(n)));
     } catch (err) {
       if (err instanceof InputError) {
-        // 行号 0 专指候选输入区、-1 专指微调区、-2 专指聚焦区：区域错误只在
-        // 对应区域提示，且不覆盖上一次有效结果；清单行号（≥1）错误整批拒绝
-        const listErrors = err.errors.filter((e) => e.line >= 1);
-        const areaErrors = err.errors.filter((e) => e.line === CANDIDATE_AREA_LINE);
-        const tuneErrors = err.errors.filter((e) => e.line === RETUNE_AREA_LINE);
-        const areaFocusErrors = err.errors.filter((e) => e.line === FOCUS_AREA_LINE);
+        // 应用建议失败时，把服务端判定归一为页面约定的稳定提示：
+        // 版本不符 -> 「清单已变化，请重新查找建议」；频率已不在重算建议集 ->
+        // 「建议不可用」。其余微调区错误沿用服务端原文。
+        let reportedErrors = err.errors;
+        if (mode === "apply") {
+          reportedErrors = err.errors.map((e) => {
+            if (e.line !== RETUNE_AREA_LINE) return e;
+            if (e.message.includes("清单已变化")) {
+              return { ...e, message: "清单已变化，请重新查找建议" };
+            }
+            if (e.message.includes("建议不可用")) {
+              return { ...e, message: `建议不可用：${formatMhz(applyReq?.freqKhz ?? 0)} MHz 已不在按当前清单重算的建议集中，请重新查找建议` };
+            }
+            return e;
+          });
+        }
+        // 行号 0 专指候选输入区、-1 专指微调区（含应用建议失败）、-2 专指聚焦区：
+        // 区域错误只在对应区域提示，且不覆盖上一次有效结果；
+        // 清单行号（≥1）错误整批拒绝。
+        // 应用失败时保留当前输入文本：runAnalyze 只在成功路径改写编辑区，
+        // 最近一次有效结果同样保留，协调员可据提示重新查找建议。
+        const listErrors = reportedErrors.filter((e) => e.line >= 1);
+        const areaErrors = reportedErrors.filter((e) => e.line === CANDIDATE_AREA_LINE);
+        const tuneErrors = reportedErrors.filter((e) => e.line === RETUNE_AREA_LINE);
+        const areaFocusErrors = reportedErrors.filter((e) => e.line === FOCUS_AREA_LINE);
         if (listErrors.length > 0) {
           setErrors(listErrors);
           setCandidateErrors([]);
@@ -170,6 +205,17 @@ export default function App() {
 
   function onRetune() {
     void runAnalyze("retune");
+  }
+
+  /**
+   * 直接采用一条微调建议：提交当前清单文本、频道名称、建议频率（整数 kHz）
+   * 与查询建议时返回的清单版本标识。服务端先比对版本、再按现有规则重算
+   * 确认频率仍在建议集中；成功后只替换目标行频率，页面据返回结果同步
+   * 编辑区、冲突分组与摘要。失败（清单已变化/建议不可用）只在微调区提示，
+   * 当前输入与最近一次有效结果均保留。
+   */
+  function onApplySuggestion(name: string, freqKhz: number, manifestVersion: string) {
+    void runAnalyze("apply", { name, freqKhz, manifestVersion });
   }
 
   function toggleFocus(name: string) {
@@ -316,8 +362,8 @@ export default function App() {
       {retuneErrors.length > 0 && (
         <section className="panel error-panel retune-error-panel" role="alert">
           <h2>
-            微调频道选择有误（{retuneErrors.length} 项）
-            {result ? "，已保留当前分析结果" : "，请重新选择"}
+            微调频点操作有误（{retuneErrors.length} 项）
+            {result ? "，已保留当前输入与最近一次有效结果" : "，请重新选择"}
           </h2>
           <ul className="error-list">
             {retuneErrors.map((e, i) => (
@@ -604,7 +650,8 @@ export default function App() {
             </div>
             <p className="hint">
               在原频率 ±500 kHz 内按 25 kHz 步长枚举合法且未占用的频点，最多 5
-              条建议；建议仅作参考，不会自动写回清单。
+              条建议；点「应用此频点」只会把目标行频率写入编辑区并按新清单重算，
+              其余行（含注释与空白）保持不变。清单改名、改频或调序后旧建议会被服务端拒绝。
             </p>
 
             {retune && (
@@ -625,6 +672,7 @@ export default function App() {
                         <th>移动量</th>
                         <th>替换后冲突</th>
                         <th>减少</th>
+                        <th>操作</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -634,6 +682,23 @@ export default function App() {
                           <td>{s.move_khz} kHz</td>
                           <td>{s.conflict_count} 项</td>
                           <td>−{s.reduced_count} 项</td>
+                          <td>
+                            <button
+                              type="button"
+                              className="secondary apply-retune-btn"
+                              data-testid={`apply-retune-${s.freq_khz}`}
+                              disabled={loading}
+                              onClick={() =>
+                                onApplySuggestion(
+                                  retune.name,
+                                  s.freq_khz,
+                                  retune.manifest_version,
+                                )
+                              }
+                            >
+                              {loading ? "应用中…" : "应用此频点"}
+                            </button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>

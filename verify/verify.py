@@ -15,7 +15,11 @@
 9. 微调频点：多个改善频点按（冲突总数，移动距离，频率升序）稳定排名且
    字段可复算、±500 kHz 与带缘边界候选参与计算、无改善返回空建议、
    未知微调频道指向微调区（行号 -1）且不影响既有结果、
-   未携带微调参数的旧请求语义不变。
+   未携带微调参数的旧请求语义不变；微调建议带由频道名称、整数 kHz 与
+   顺序确定的清单版本标识，可直接应用：未编辑清单可应用建议且冲突数按
+   返回结果下降（只替换目标行，注释/空白保留），改名或改频后携带旧标识
+   确定失败（提示重新查找建议），仅改注释/空白仍可应用，未被返回的频率
+   遭拒绝（建议不可用），旧请求不出现 applied 字段。
 10. 聚焦排查：直接影响（目标即重点频道）整体排在来源相关（仅来源组合
     含重点频道）之前且两类内部保持原有顺序、含多组来源的条目不拆分不
     重复、无相关冲突返回明确空结果、完整冲突分组与摘要不因聚焦改写、
@@ -69,6 +73,7 @@ def analyze(
     candidate: dict | None = None,
     retune: str | None = None,
     focus: list | None = None,
+    apply: dict | None = None,
 ) -> httpx.Response:
     payload = {"input": text}
     if candidate is not None:
@@ -77,6 +82,8 @@ def analyze(
         payload["retune"] = retune
     if focus is not None:
         payload["focus"] = focus
+    if apply is not None:
+        payload["apply"] = apply
     return httpx.post(f"{API}/api/analyze", json=payload, timeout=10)
 
 
@@ -511,6 +518,205 @@ def main() -> int:
             f"旧字段集合被改变: {set(data.keys())}",
         )
 
+    BOUNDARY_TEXT = "A 500.000\nB 500.100\nC 499.850\nD 500.250"
+
+    def _retune_version_and_suggestions(text: str, name: str):
+        resp = analyze(text, retune=name)
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        ret = resp.json()["retune"]
+        version = ret.get("manifest_version")
+        expect(
+            isinstance(version, str)
+            and re.fullmatch(r"mv1-[0-9a-f]{64}", version) is not None,
+            f"微调建议应带清单版本标识: {ret}",
+        )
+        return version, ret["suggestions"]
+
+    def t_retune_response_carries_manifest_version():
+        # 版本标识由频道名称、整数 kHz 与顺序确定：同清单稳定、等价小数写法不变
+        v1, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        v2, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "B")
+        expect(v1 == v2, f"同清单版本应一致: {v1} != {v2}")
+        v3, _ = _retune_version_and_suggestions(
+            "A 500.000\nB 500.1\nC 499.850\nD 500.250", "A"
+        )
+        expect(v1 == v3, "500.1 与 500.100 同频，版本应一致")
+
+    def t_apply_suggestion_unedited_list_conflict_count_drops():
+        # 未编辑清单：可直接应用返回的建议，冲突数按返回结果下降，只替换目标行
+        version, suggestions = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        expect(suggestions, "应存在改善建议")
+        first = suggestions[0]
+        expect(
+            first["freq_khz"] == 499_875 and first["conflict_count"] == 0,
+            f"首选建议不符: {first}",
+        )
+        resp = analyze(
+            BOUNDARY_TEXT,
+            apply={"name": "A", "freq_khz": first["freq_khz"], "version": version},
+        )
+        expect(resp.status_code == 200, f"应用建议应成功: HTTP {resp.status_code} {resp.text[:200]}")
+        data = resp.json()
+        applied = data.get("applied")
+        expect(bool(applied), "应用成功响应必须包含 applied 对象")
+        expected_text = "A 499.875\nB 500.100\nC 499.850\nD 500.250"
+        expect(
+            applied["applied_text"] == expected_text and applied["freq_khz"] == 499_875,
+            f"只应替换目标行频率: {applied}",
+        )
+        expect(
+            [c["freq_khz"] for c in data["channels"]] == [499_875, 500_100, 499_850, 500_250],
+            "顶层 channels 应为替换后清单",
+        )
+        # 冲突数按返回结果下降（4 -> 0），完整分析与摘要均针对替换后清单
+        expect(data["conflict_count"] == 0, f"冲突数应降为 0: {data['conflict_count']}")
+        expect(data["conflicts"] == [], "替换后应零项冲突")
+        expect("冲突总数：0" in data["summary"], "摘要应反映零冲突")
+        # 顶层结果与 applied_text 重新解析分析自洽
+        plain = analyze(expected_text).json()
+        expect(
+            data["channels"] == plain["channels"] and data["conflicts"] == plain["conflicts"],
+            "应用结果应与新清单重算结果一致",
+        )
+        # 成功响应只多出 applied 字段，不夹带 retune/candidate/focus
+        expect(
+            set(data.keys())
+            == {"channel_count", "channels", "conflict_count", "conflicts", "summary", "applied"},
+            f"应用响应字段集合不符: {set(data.keys())}",
+        )
+        # 每条返回建议都应可应用且冲突数与建议一致
+        for s in suggestions:
+            r = analyze(
+                BOUNDARY_TEXT,
+                apply={"name": "A", "freq_khz": s["freq_khz"], "version": version},
+            )
+            expect(r.status_code == 200, f"建议 {s} 应可应用")
+            expect(r.json()["conflict_count"] == s["conflict_count"], "冲突数应与建议一致")
+
+    def t_apply_stale_version_after_rename_or_freq_change_fails():
+        # 改名或改频（含调序）后携带旧版本标识：确定失败，提示重新查找建议
+        version, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        for changed in [
+            "A2 500.000\nB 500.100\nC 499.850\nD 500.250",
+            "A 500.001\nB 500.100\nC 499.850\nD 500.250",
+            "B 500.100\nA 500.000\nC 499.850\nD 500.250",
+        ]:
+            resp = analyze(
+                changed,
+                apply={"name": "A", "freq_khz": 499_875, "version": version},
+            )
+            expect(resp.status_code == 422, f"旧标识应 422: {changed}")
+            data = resp.json()
+            expect("applied" not in data and "conflicts" not in data, "失败不得出现应用结果字段")
+            errors = data["errors"]
+            expect(
+                [e["line"] for e in errors] == [-1],
+                f"应用失败错误须指向微调区(line=-1): {errors}",
+            )
+            expect(
+                errors[0]["message"] == "清单已变化，请重新查找建议",
+                f"版本不符提示不符: {errors}",
+            )
+
+    def t_apply_still_works_after_comment_or_whitespace_only_edit():
+        # 仅调整注释或空白而频道序列未变：旧版本标识仍可应用，注释/空白原样保留
+        version, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        edited = (
+            "# 演出前排频表\n"
+            "  A 500.000\n"
+            "\n"
+            "B   500.100\n"
+            "C 499.850\n"
+            "D 500.250\n"
+        )
+        resp = analyze(
+            edited,
+            apply={"name": "A", "freq_khz": 499_875, "version": version},
+        )
+        expect(resp.status_code == 200, f"注释/空白编辑后应仍可应用: HTTP {resp.status_code}")
+        applied = resp.json()["applied"]
+        expect(
+            applied["applied_text"]
+            == "# 演出前排频表\n  A 499.875\n\nB   500.100\nC 499.850\nD 500.250\n",
+            f"注释与空白应原样保留、仅替换目标行: {applied['applied_text']!r}",
+        )
+        expect(resp.json()["conflict_count"] == 0, "冲突数应按返回结果下降")
+
+    def t_apply_frequency_not_in_suggestion_set_rejected():
+        # 未被返回的频率：占用频点 / 原位频率 / 非 25 kHz 网格 / 带外，均拒绝
+        version, suggestions = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        returned = {s["freq_khz"] for s in suggestions}
+        for bad_freq in [500_100, 500_000, 499_999, 469_975]:
+            expect(bad_freq not in returned, f"{bad_freq} 不应在建议集中")
+            resp = analyze(
+                BOUNDARY_TEXT,
+                apply={"name": "A", "freq_khz": bad_freq, "version": version},
+            )
+            expect(resp.status_code == 422, f"未返回频率 {bad_freq} 应 422")
+            data = resp.json()
+            expect("applied" not in data and "conflicts" not in data, "拒绝时不得出现应用结果字段")
+            errors = data["errors"]
+            expect([e["line"] for e in errors] == [-1], f"应指向微调区: {errors}")
+            expect("建议不可用" in errors[0]["message"], f"应提示建议不可用: {errors}")
+
+    def t_apply_malformed_request_points_to_retune_area():
+        version, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        cases = [
+            "oops",
+            123,
+            [],
+            {},
+            {"name": "A", "freq_khz": 499_875},  # 缺 version
+            {"name": "A", "version": version},  # 缺 freq_khz
+            {"freq_khz": 499_875, "version": version},  # 缺 name
+            {"name": "A", "freq_khz": "499875", "version": version},  # 频率非整数 kHz
+            {"name": "A", "freq_khz": 499_875, "version": "garbage"},  # 版本形态非法
+        ]
+        for value in cases:
+            resp = httpx.post(
+                f"{API}/api/analyze",
+                json={"input": BOUNDARY_TEXT, "apply": value},
+                timeout=10,
+            )
+            expect(resp.status_code == 422, f"apply={value} 应 422")
+            data = resp.json()
+            expect("applied" not in data and "conflicts" not in data, "结构非法不得给结果")
+            errors = data["errors"]
+            expect(
+                errors and all(e["line"] == -1 for e in errors),
+                f"应用结构错误须指向微调区: {errors}",
+            )
+
+    def t_apply_invalid_list_rejected_with_original_line_numbers():
+        version, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        resp = analyze(
+            "CH1 500.0005\nCH2 469.000",
+            apply={"name": "A", "freq_khz": 499_875, "version": version},
+        )
+        expect(resp.status_code == 422, f"应 422，实际 {resp.status_code}")
+        data = resp.json()
+        expect("applied" not in data and "conflicts" not in data, "清单非法不得给应用结果")
+        expect([e["line"] for e in data["errors"]] == [1, 2], "须保留原行号整批拒绝")
+
+    def t_legacy_requests_never_contain_applied_field():
+        # 普通分析 / 候选试加 / 仅查询微调建议 / 聚焦排查的响应均不出现 applied
+        for payload in [
+            {"input": BOUNDARY_TEXT},
+            {"input": BOUNDARY_TEXT, "candidate": {"name": "X", "freq": "470.100"}},
+            {"input": BOUNDARY_TEXT, "retune": "A"},
+            {"input": BOUNDARY_TEXT, "focus": ["A"]},
+        ]:
+            resp = httpx.post(f"{API}/api/analyze", json=payload, timeout=10)
+            expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+            expect("applied" not in resp.json(), f"旧请求不应出现 applied: {payload}")
+        # 应用失败响应同样不得夹带 applied 字段
+        version, _ = _retune_version_and_suggestions(BOUNDARY_TEXT, "A")
+        failed = analyze(
+            "A2 500.000\nB 500.100\nC 499.850\nD 500.250",
+            apply={"name": "A", "freq_khz": 499_875, "version": version},
+        )
+        expect("applied" not in failed.json(), "失败响应不得出现 applied")
+
     def t_focus_direct_before_source_and_results_unchanged():
         # 重点频道 A：目标为 A 的条目（直接影响）整体排在仅来源含 A 的条目
         # （来源相关）之前；完整冲突分组与摘要不因聚焦而改写
@@ -666,6 +872,9 @@ def main() -> int:
         expect("试加频道" in bundle, "JS bundle 应包含候选试加按钮")
         expect("候选输入区" in bundle, "JS bundle 应包含候选错误定位提示")
         expect("查找微调频点" in bundle, "JS bundle 应包含微调频点按钮")
+        expect("应用此频点" in bundle, "JS bundle 应包含应用建议按钮")
+        expect("清单已变化，请重新查找建议" in bundle, "JS bundle 应包含清单过期提示")
+        expect("建议不可用" in bundle, "JS bundle 应包含建议不可用提示")
         expect("范围内无改善" in bundle, "JS bundle 应包含微调无改善提示")
         expect("微调区" in bundle, "JS bundle 应包含微调错误定位提示")
         expect("聚焦排查" in bundle, "JS bundle 应包含聚焦排查按钮")
@@ -717,6 +926,40 @@ def main() -> int:
             and ret["suggestions"][0]["freq_khz"] == 499_875,
             f"反代微调建议不符: {ret and ret['suggestions']}",
         )
+        expect(
+            isinstance(ret.get("manifest_version"), str),
+            "反代微调建议应带清单版本标识",
+        )
+
+    def t_web_proxy_apply_retune():
+        # 页面的「应用此频点」同样经 /api 反代到真实接口：
+        # 先查建议取版本标识，再应用首条建议，冲突数按返回结果下降
+        text = "A 500.000\nB 500.100\nC 499.850\nD 500.250"
+        ret = httpx.post(
+            f"{WEB}/api/analyze", json={"input": text, "retune": "A"}, timeout=10
+        ).json()["retune"]
+        version = ret["manifest_version"]
+        first = ret["suggestions"][0]
+        resp = httpx.post(
+            f"{WEB}/api/analyze",
+            json={
+                "input": text,
+                "apply": {
+                    "name": "A",
+                    "freq_khz": first["freq_khz"],
+                    "version": version,
+                },
+            },
+            timeout=10,
+        )
+        expect(resp.status_code == 200, f"经反代应用失败: HTTP {resp.status_code}")
+        data = resp.json()
+        expect(data["conflict_count"] == 0, "应用后冲突应降为 0")
+        expect(
+            data["applied"]["applied_text"]
+            == "A 499.875\nB 500.100\nC 499.850\nD 500.250",
+            "反代应用应只替换目标行频率",
+        )
 
     def t_web_proxy_focus():
         # 页面的聚焦排查同样经 /api 反代到真实接口
@@ -767,6 +1010,14 @@ def main() -> int:
         ("微调频点：未知/非法微调频道指向微调区", t_retune_unknown_channel_points_to_retune_area),
         ("微调频点：清单非法仍按原行号整批拒绝", t_retune_invalid_list_rejected_with_original_line_numbers),
         ("不带微调参数的旧请求维持原字段语义", t_legacy_request_without_retune_unchanged),
+        ("应用建议：微调响应带由名称/整数kHz/顺序确定的清单版本标识", t_retune_response_carries_manifest_version),
+        ("应用建议：未编辑清单可应用且冲突数按返回结果下降、只替换目标行", t_apply_suggestion_unedited_list_conflict_count_drops),
+        ("应用建议：改名/改频/调序后携带旧版本标识确定失败", t_apply_stale_version_after_rename_or_freq_change_fails),
+        ("应用建议：仅调整注释或空白而频道序列未变时仍可应用", t_apply_still_works_after_comment_or_whitespace_only_edit),
+        ("应用建议：未被返回的频率遭拒绝且提示建议不可用", t_apply_frequency_not_in_suggestion_set_rejected),
+        ("应用建议：结构错误指向微调区且不出现应用结果字段", t_apply_malformed_request_points_to_retune_area),
+        ("应用建议：清单非法仍按原行号整批拒绝", t_apply_invalid_list_rejected_with_original_line_numbers),
+        ("应用建议：普通/候选/微调/聚焦旧请求不出现 applied 字段", t_legacy_requests_never_contain_applied_field),
         ("聚焦排查：直接影响排在来源相关之前且完整结果不改写", t_focus_direct_before_source_and_results_unchanged),
         ("聚焦排查：含多组来源的条目不拆分不重复", t_focus_multi_source_entry_not_split_or_duplicated),
         ("聚焦排查：无相关冲突返回明确空结果", t_focus_no_related_conflicts_returns_empty),
@@ -777,6 +1028,7 @@ def main() -> int:
         ("Web /api 反代联调链路", t_web_proxy_to_api),
         ("Web /api 反代候选试加链路", t_web_proxy_candidate_trial),
         ("Web /api 反代微调频点链路", t_web_proxy_retune),
+        ("Web /api 反代应用微调频点链路", t_web_proxy_apply_retune),
         ("Web /api 反代聚焦排查链路", t_web_proxy_focus),
     ]
     for name, fn in checks:

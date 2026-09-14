@@ -134,6 +134,9 @@ function fillCandidate(name: string, freq: string) {
   fireEvent.change(screen.getByLabelText(/候选频率/), { target: { value: freq } });
 }
 
+const RETUNE_MANIFEST_VERSION = "mv1-" + "a".repeat(64);
+const RETUNE_NEW_MANIFEST_VERSION = "mv1-" + "b".repeat(64);
+
 const RETUNE_RESULT: RetuneOut = {
   name: "A",
   original_freq_khz: 500_000,
@@ -143,6 +146,7 @@ const RETUNE_RESULT: RetuneOut = {
     { freq_khz: 500_125, move_khz: 125, conflict_count: 0, reduced_count: 4 },
     { freq_khz: 499_825, move_khz: 175, conflict_count: 0, reduced_count: 4 },
   ],
+  manifest_version: RETUNE_MANIFEST_VERSION,
 };
 
 const RETUNE_RESPONSE: AnalyzeResponse = {
@@ -157,6 +161,7 @@ const RETUNE_EMPTY_RESPONSE: AnalyzeResponse = {
     original_freq_khz: 500_000,
     baseline_conflict_count: 4,
     suggestions: [],
+    manifest_version: RETUNE_MANIFEST_VERSION,
   },
 };
 
@@ -585,7 +590,7 @@ describe("微调频点", () => {
     fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
 
     expect(
-      await screen.findByText(/微调频道选择有误（1 项），已保留当前分析结果/),
+      await screen.findByText(/微调频点操作有误（1 项），已保留当前输入与最近一次有效结果/),
     ).toBeInTheDocument();
     expect(screen.getByText("微调区")).toBeInTheDocument();
     expect(screen.getByText(/微调频道「A」不在当前清单中/)).toBeInTheDocument();
@@ -627,7 +632,265 @@ describe("微调频点", () => {
     expect(await screen.findByText(/输入有误（1 项）/)).toBeInTheDocument();
     expect(screen.getByText("第 1 行")).toBeInTheDocument();
     expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/微调频道选择有误/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/微调频点操作有误/)).not.toBeInTheDocument();
+  });
+});
+
+describe("应用微调频点", () => {
+  const APPLIED_TEXT = "A 499.875\nB 500.100\nC 499.850\nD 500.250";
+  const APPLIED_RESPONSE: AnalyzeResponse = {
+    channel_count: 4,
+    channels: [
+      { name: "A", freq_khz: 499_875, line: 1 },
+      { name: "B", freq_khz: 500_100, line: 2 },
+      { name: "C", freq_khz: 499_850, line: 3 },
+      { name: "D", freq_khz: 500_250, line: 4 },
+    ],
+    conflict_count: 0,
+    conflicts: [],
+    summary: "无线话筒三阶互调排查摘要\n冲突总数：0\n结论：安全清单，零项冲突。",
+    applied: {
+      name: "A",
+      freq_khz: 499_875,
+      version: RETUNE_NEW_MANIFEST_VERSION,
+      applied_text: APPLIED_TEXT,
+    },
+  };
+
+  it("每条建议旁有应用此频点按钮，点击后携带当前清单、名称、整数kHz与版本标识", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const listInput = "A 500.000\nB 500.100\nC 499.850\nD 500.250";
+    submitForm(listInput);
+    await screen.findByText(/发现 4 项冲突/);
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+    await screen.findByText("499.875 MHz");
+
+    // 每条建议旁都有「应用此频点」
+    const applyButtons = screen.getAllByRole("button", { name: "应用此频点" });
+    expect(applyButtons).toHaveLength(3);
+
+    fireEvent.click(applyButtons[0]);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const [url, init] = fetchMock.mock.calls[2];
+    expect(url).toBe("/api/analyze");
+    expect(JSON.parse(init.body)).toEqual({
+      input: listInput,
+      apply: {
+        name: "A",
+        freq_khz: 499_875,
+        version: RETUNE_MANIFEST_VERSION,
+      },
+    });
+  });
+
+  it("应用成功后同步编辑区文本、冲突分组与摘要，冲突数按返回结果下降", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => APPLIED_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+    await screen.findByText("499.875 MHz");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "应用此频点" })[0]);
+
+    // 编辑区被服务端返回的 applied_text 覆盖（只改目标行）
+    await waitFor(() =>
+      expect(screen.getByLabelText(/频道清单/)).toHaveValue(APPLIED_TEXT),
+    );
+    // 摘要与分组同步为零冲突结果
+    expect(await screen.findByText(/安全清单：零项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/冲突总数：0/)).toBeInTheDocument();
+    expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
+    // 旧的建议表已随应用结果收起（响应不带 retune）
+    expect(screen.queryByText("499.875 MHz")).not.toBeInTheDocument();
+    expect(screen.queryAllByRole("button", { name: "应用此频点" })).toHaveLength(0);
+  });
+
+  it("清单改名或改频后携带旧版本标识应用，微调区提示重新查找且保留输入与最近结果", async () => {
+    const editedText = "A2 500.000\nB 500.100\nC 499.850\nD 500.250";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [{ line: -1, message: "清单已变化，请重新查找建议" }],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+    await screen.findByText("499.875 MHz");
+
+    // 查看建议后未重新提交，直接把清单中的 A 改名为 A2，再点同一条旧建议
+    fireEvent.change(screen.getByLabelText(/频道清单/), { target: { value: editedText } });
+    fireEvent.click(screen.getAllByRole("button", { name: "应用此频点" })[0]);
+
+    expect(await screen.findByText("清单已变化，请重新查找建议")).toBeInTheDocument();
+    expect(screen.getByText("微调区")).toBeInTheDocument();
+    // 当前输入保留（仍是改名后的文本，未被旧建议写回）
+    expect(screen.getByLabelText(/频道清单/)).toHaveValue(editedText);
+    // 最近一次有效结果（4 项冲突分组与旧建议）保留
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "应用此频点" }).length).toBeGreaterThan(0);
+    // 请求体确实携带了旧版本标识与改名后的清单
+    const [, init] = fetchMock.mock.calls[2];
+    expect(JSON.parse(init.body)).toEqual({
+      input: editedText,
+      apply: { name: "A", freq_khz: 499_875, version: RETUNE_MANIFEST_VERSION },
+    });
+  });
+
+  it("建议频率不属于重算建议集时微调区提示建议不可用，输入与最近结果保留", async () => {
+    const fetchMock = vi
+      .fn()
+      // 页面拿到的建议集不含该频率（此处模拟服务端按重算规则拒绝）
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [
+            {
+              line: -1,
+              message: "建议不可用：500.000 MHz 不在按当前清单重算的微调建议集中，请重新查找建议",
+            },
+          ],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const listInput = "A 500.000\nB 500.100\nC 499.850\nD 500.250";
+    submitForm(listInput);
+    await screen.findByText(/发现 4 项冲突/);
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+    await screen.findByText("499.875 MHz");
+
+    // 直接以旧请求可能出现的占用频点（服务端拒绝）触发：通过 data-testid 不可构造时，
+    // 用按钮点击模拟；这里服务端固定返回不可用，验证提示与保留行为
+    fireEvent.click(screen.getAllByRole("button", { name: "应用此频点" })[0]);
+
+    expect(await screen.findByText(/建议不可用/)).toBeInTheDocument();
+    expect(screen.getByLabelText(/频道清单/)).toHaveValue(listInput);
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(screen.queryByText(/安全清单：零项冲突/)).not.toBeInTheDocument();
+  });
+
+  it("仅调整注释或空白而频道序列未变时仍可应用，注释与空白原样保留", async () => {
+    const editedText = "# 演出前排频表\nA 500.000\n\nB   500.100\nC 499.850\nD 500.250";
+    const expectedApplied =
+      "# 演出前排频表\nA 499.875\n\nB   500.100\nC 499.850\nD 500.250";
+    const appliedWithComments: AnalyzeResponse = {
+      ...APPLIED_RESPONSE,
+      channels: [
+        { name: "A", freq_khz: 499_875, line: 2 },
+        { name: "B", freq_khz: 500_100, line: 4 },
+        { name: "C", freq_khz: 499_850, line: 5 },
+        { name: "D", freq_khz: 500_250, line: 6 },
+      ],
+      applied: { ...APPLIED_RESPONSE.applied!, applied_text: expectedApplied },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => appliedWithComments,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+    await screen.findByText("499.875 MHz");
+
+    // 只加注释/空行/空白，不改频道名称与频率：旧版本标识仍被服务端接受
+    fireEvent.change(screen.getByLabelText(/频道清单/), { target: { value: editedText } });
+    fireEvent.click(screen.getAllByRole("button", { name: "应用此频点" })[0]);
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(/频道清单/)).toHaveValue(expectedApplied),
+    );
+    expect(await screen.findByText(/安全清单：零项冲突/)).toBeInTheDocument();
+    // 应用请求携带的仍是注释编辑后的当前文本与旧版本标识
+    const [, init] = fetchMock.mock.calls[2];
+    expect(JSON.parse(init.body)).toEqual({
+      input: editedText,
+      apply: { name: "A", freq_khz: 499_875, version: RETUNE_MANIFEST_VERSION },
+    });
   });
 });
 

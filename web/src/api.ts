@@ -14,11 +14,22 @@ export interface CandidateInput {
   freq: string;
 }
 
+/** 直接应用一条微调建议：回传频道名称、建议频率（整数 kHz）与清单版本标识 */
+export interface RetuneApplyInput {
+  name: string;
+  freqKhz: number;
+  manifestVersion: string;
+}
+
 /**
  * 提交频道清单进行互调排查。
  * 请求真实后端接口 /api/analyze（开发环境由 vite 代理，生产由 nginx 反代）。
  * candidate 非空时携带候选对象，后端在保留基线结果的同时返回增量评估；
- * retune 非空时携带微调频道名称，后端返回该频道 ±500 kHz 内的替换频点建议；
+ * retune 非空时携带微调频道名称，后端返回该频道 ±500 kHz 内的替换频点建议
+ * （含清单版本标识 manifest_version）；
+ * apply 非空时携带 {name, freq_khz, version} 直接应用一条建议：
+ * 服务端先比对版本再按现有规则重算确认频率仍在建议集中，通过后只替换目标行
+ * 频率并返回更新后的完整分析与 applied.applied_text；
  * focus 非空时携带一至三个重点频道名称，后端复用现有冲突结果返回聚焦分级，
  * 完整结果与可复制摘要不因聚焦而改写。
  */
@@ -27,6 +38,7 @@ export async function analyze(
   candidate?: CandidateInput,
   retune?: string,
   focus?: string[],
+  apply?: RetuneApplyInput,
 ): Promise<AnalyzeResponse> {
   const payload: Record<string, unknown> = { input };
   if (candidate) {
@@ -37,6 +49,13 @@ export async function analyze(
   }
   if (focus && focus.length > 0) {
     payload.focus = focus;
+  }
+  if (apply) {
+    payload.apply = {
+      name: apply.name,
+      freq_khz: apply.freqKhz,
+      version: apply.manifestVersion,
+    };
   }
   let res: Response;
   try {

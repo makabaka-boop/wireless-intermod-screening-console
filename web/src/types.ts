@@ -59,6 +59,19 @@ export interface RetuneOut {
   baseline_conflict_count: number;
   /** 按 冲突总数 → 移动距离 → 频率升序 稳定排名，最多 5 条；为空即范围内无改善 */
   suggestions: RetuneSuggestionOut[];
+  /** 生成建议时的清单版本标识（频道名称 + 整数 kHz + 顺序）；应用建议时原样回传 */
+  manifest_version: string;
+}
+
+/** 成功应用一条微调建议的结果（仅携带 apply 且应用成功的请求返回） */
+export interface ApplyOut {
+  name: string;
+  /** 实际应用的替换频率（整数 kHz） */
+  freq_khz: number;
+  /** 应用成功后新清单的版本标识 */
+  version: string;
+  /** 只替换目标行频率后的清单文本，页面据此同步编辑区（注释/空白原样保留） */
+  applied_text: string;
 }
 
 /** 聚焦排查：一条与重点频道相关的冲突条目（保留原目标、产物与全部来源） */
@@ -94,6 +107,8 @@ export interface AnalyzeResponse {
   candidate?: CandidateOut;
   retune?: RetuneOut;
   focus?: FocusOut;
+  /** 仅应用微调建议成功时出现：顶层 channels/conflicts/summary 即替换后清单的完整分析 */
+  applied?: ApplyOut;
 }
 
 export interface ErrorItem {

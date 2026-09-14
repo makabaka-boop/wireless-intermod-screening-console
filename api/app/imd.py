@@ -23,7 +23,12 @@
 合法（频段内）且未被其他频道占用的替换频点，复用 :func:`analyze`
 重新计算整表冲突，仅保留冲突总数严格优于当前清单的方案，
 按（冲突总数，移动距离，频率升序）稳定排名，最多返回
-:data:`RETUNE_MAX_SUGGESTIONS` 条建议；建议只作展示，不写回清单。
+:data:`RETUNE_MAX_SUGGESTIONS` 条建议；评估结果带由频道名称、整数 kHz
+与顺序确定的清单版本标识（:func:`manifest_version`）。页面可直接应用某条
+建议：``parse_retune_apply`` 校验应用请求，``validate_retune_apply``
+先比对当前清单版本、再按现有规则重算确认频率仍在建议集中，通过后
+``apply_retune`` 只替换目标行频率并重算完整分析；版本不符或建议不可用
+均按微调区错误（:data:`RETUNE_LINE`，-1）拒绝，不改写清单。
 微调区错误使用 :data:`RETUNE_LINE`（-1）作为行号。
 
 聚焦排查（围绕主持人/主唱等重点话筒优先处理冲突）：
@@ -37,6 +42,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 
@@ -55,6 +61,13 @@ RETUNE_STEP_KHZ = 25
 RETUNE_MAX_SUGGESTIONS = 5
 # 微调区错误的固定行号（-1 专指微调区，与清单行号、候选区行号区分）
 RETUNE_LINE = -1
+
+# 清单版本标识：由频道名称、整数 kHz 频率与频道顺序确定（与注释/空白无关），
+# 仅用于让页面在应用微调建议时确认清单未在查看建议后发生变化；
+# 带版本前缀便于日后调整口径
+MANIFEST_VERSION_PREFIX = "mv1"
+# 应用建议请求中提交的清单版本标识形如 mv1-<64 位十六进制>
+MANIFEST_VERSION_PATTERN = re.compile(r"^" + MANIFEST_VERSION_PREFIX + r"-[0-9a-f]{64}$")
 
 # 聚焦排查：一次最多勾选 3 个重点频道
 FOCUS_MAX_CHANNELS = 3
@@ -188,6 +201,20 @@ def parse_channels(text: str) -> tuple[list[Channel], list[InputError]]:
         errors.append(InputError(1, f"输入为空：请至少提供 {MIN_CHANNELS} 个频道"))
 
     return channels, errors
+
+
+def manifest_version(channels: list[Channel]) -> str:
+    """由频道名称、整数 kHz 频率与频道顺序确定的清单版本标识。
+
+    每项取 ``顺序:名称:整数kHz``（顺序从 0 开始），以换行连接后取 SHA-256；
+    注释与空白不参与解析，自然不影响版本——只调整注释或空白而频道序列
+    （名称/频率/顺序）未变时，版本标识保持一致。
+    """
+    payload = "\n".join(
+        f"{idx}:{c.name}:{c.freq_khz}" for idx, c in enumerate(channels)
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"{MANIFEST_VERSION_PREFIX}-{digest}"
 
 
 def analyze(channels: list[Channel]) -> list[Conflict]:
@@ -452,6 +479,9 @@ class RetuneEvaluation:
     baseline_conflicts: list[Conflict]  # 当前清单的完整冲突分组
     # 按（冲突总数，移动距离，频率升序）稳定排名，最多 RETUNE_MAX_SUGGESTIONS 条
     suggestions: list[RetuneSuggestion]
+    # 生成建议时的清单版本标识（频道名称 + 整数 kHz + 顺序）：
+    # 页面应用建议时回传，服务端据此拒绝过期清单的旧建议
+    version: str
 
     @property
     def baseline_conflict_count(self) -> int:
@@ -530,6 +560,7 @@ def evaluate_retune(channels: list[Channel], target: Channel) -> RetuneEvaluatio
         original_freq_khz=target.freq_khz,
         baseline_conflicts=baseline,
         suggestions=suggestions[:RETUNE_MAX_SUGGESTIONS],
+        version=manifest_version(channels),
     )
 
 
@@ -669,3 +700,160 @@ def evaluate_focus(
     # Python sort 稳定：仅按关系等级排序即可在两类内部保留原有冲突顺序
     entries.sort(key=lambda e: 0 if e.relation == FOCUS_RELATION_DIRECT else 1)
     return FocusEvaluation(names=list(focus_names), entries=entries)
+
+
+@dataclass
+class RetuneApply:
+    """一次成功的「应用此频点」：只替换目标行频率后的清单与重算结果。"""
+
+    name: str
+    freq_khz: int  # 实际应用的替换频率（整数 kHz）
+    version: str  # 应用成功后新清单的版本标识
+    applied_text: str  # 替换目标行频率后的清单文本（注释/空白与其余行原样保留）
+    applied_channels: list[Channel]  # 替换后的频道列表（行号不变）
+    conflicts: list[Conflict]  # 替换后清单的完整冲突分组
+
+
+def parse_retune_apply(
+    value: object, channels: list[Channel]
+) -> tuple[str, int, str, list[InputError]]:
+    """校验应用建议请求 ``{name, freq_khz, version}`` 的字段与类型。
+
+    成功返回（频道名称，整数 kHz 频率，版本标识，无错误）；
+    失败时前三项为空值且错误全部指向微调区（:data:`RETUNE_LINE`）。
+    这里只做结构与类型校验：版本是否匹配、频率是否仍在建议集中由
+    :func:`validate_retune_apply` 依据当前清单重算确认，避免旧建议被误写入。
+    """
+    if not isinstance(value, dict):
+        return "", 0, "", [
+            InputError(
+                RETUNE_LINE,
+                "应用微调频点请求格式错误：应为包含频道名称、建议频率与清单版本的对象",
+            )
+        ]
+
+    errors: list[InputError] = []
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append(
+            InputError(
+                RETUNE_LINE,
+                "应用微调频点请求缺少频道名称：请从微调建议旁重新点击「应用此频点」",
+            )
+        )
+        name = ""
+    else:
+        name = name.strip()
+
+    freq_khz = value.get("freq_khz")
+    # bool 是 int 的子类型，须显式排除；整数 kHz 不接受浮点/字符串
+    if not isinstance(freq_khz, int) or isinstance(freq_khz, bool):
+        errors.append(
+            InputError(
+                RETUNE_LINE,
+                "应用微调频点请求的建议频率格式错误：应为整数 kHz，请从微调建议旁重新点击"
+                "「应用此频点」",
+            )
+        )
+        freq_khz = 0
+
+    version = value.get("version")
+    if not isinstance(version, str) or not MANIFEST_VERSION_PATTERN.match(version):
+        errors.append(
+            InputError(
+                RETUNE_LINE,
+                "应用微调频点请求的清单版本标识格式错误：请重新查找建议后再应用",
+            )
+        )
+        version = ""
+
+    if errors:
+        return "", 0, "", errors
+    return name, freq_khz, version, []
+
+
+def validate_retune_apply(
+    channels: list[Channel], name: str, freq_khz: int, version: str
+) -> tuple[Channel | None, RetuneSuggestion | None, list[InputError]]:
+    """按当前清单重新校验应用请求，顺序与页面提示对应。
+
+    1. 先比对当前解析结果的版本标识与请求携带的标识：不一致说明清单已变化
+       （改名、改频或调整频道顺序），提示重新查找建议；
+    2. 再确认微调目标频道仍在当前清单中；
+    3. 最后按现有规则重算该频道的建议集，确认请求频率仍是其中一条
+       （合法、未被占用且严格优于当前清单）。
+    任何一步失败都不得改写清单。
+    """
+    if manifest_version(channels) != version:
+        return None, None, [
+            InputError(
+                RETUNE_LINE,
+                "清单已变化，请重新查找建议",
+            )
+        ]
+
+    target, target_errors = parse_retune_target(name, channels)
+    if target_errors:
+        return None, None, target_errors
+
+    # 按现有规则重算建议集（枚举口径与「查找微调频点」完全一致），
+    # 只接受仍在建议集中的频率，杜绝未被返回的频率被写入
+    evaluation = evaluate_retune(channels, target)
+    for suggestion in evaluation.suggestions:
+        if suggestion.freq_khz == freq_khz:
+            return target, suggestion, []
+    return None, None, [
+        InputError(
+            RETUNE_LINE,
+            f"建议不可用：{format_mhz(freq_khz)} MHz 不在按当前清单重算的微调建议集中，"
+            "请重新查找建议",
+        )
+    ]
+
+
+def apply_retune_text(text: str, target: Channel, freq_khz: int) -> str:
+    """只替换目标行（``target.line``）的频率文本，其余字符（含注释与空白）原样保留。
+
+    行内仍按解析口径的两列结构（名称 + 频率，空白或中英文逗号分隔）定位频率，
+    行首缩进与列间分隔符保持不变；行尾换行若存在也原样保留。
+    """
+    lines = text.splitlines(keepends=True)
+    idx = target.line - 1
+    raw = lines[idx]
+    if raw.endswith("\n"):
+        body, ending = raw[:-1], "\n"
+    else:
+        body, ending = raw, ""
+    if body.endswith("\r"):
+        body, ending = body[:-1], "\r" + ending
+
+    match = re.match(r"^(\s*\S+[\s,，]+)(\S+)(\s*)$", body)
+    if match:
+        prefix, _old_freq, suffix = match.groups()
+        body = f"{prefix}{format_mhz(freq_khz)}{suffix}"
+    else:  # 兜底：理论上不会到达（该行已按同一口径成功解析）
+        body = f"{target.name} {format_mhz(freq_khz)}"
+    lines[idx] = body + ending
+    return "".join(lines)
+
+
+def apply_retune(
+    text: str,
+    channels: list[Channel],
+    target: Channel,
+    suggestion: RetuneSuggestion,
+) -> RetuneApply:
+    """只替换目标行频率并对替换后的清单重算完整分析。"""
+    freq_khz = suggestion.freq_khz
+    applied_channels = [
+        Channel(c.name, freq_khz, c.line) if c.name == target.name else c
+        for c in channels
+    ]
+    return RetuneApply(
+        name=target.name,
+        freq_khz=freq_khz,
+        version=manifest_version(applied_channels),
+        applied_text=apply_retune_text(text, target, freq_khz),
+        applied_channels=applied_channels,
+        conflicts=analyze(applied_channels),
+    )

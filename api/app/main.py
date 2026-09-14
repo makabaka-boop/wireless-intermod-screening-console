@@ -6,9 +6,14 @@
   请求体可选携带 ``candidate``（{"name", "freq"}）进行彩排试加评估，
   响应在保留基线字段语义的同时增加 ``candidate`` 评估对象；
   亦可携带 ``retune``（已登记频道名称）获取该频道 ±500 kHz 内的
-  微调频点建议，响应增加 ``retune`` 评估对象；
+  微调频点建议（含清单版本标识 ``manifest_version``），响应增加
+  ``retune`` 评估对象；
   亦可携带 ``focus``（一至三个重点频道名称列表）对现有冲突结果做
-  聚焦排查，响应增加 ``focus`` 评估对象，完整结果与摘要不因此改写。
+  聚焦排查，响应增加 ``focus`` 评估对象，完整结果与摘要不因此改写；
+  亦可携带 ``apply``（{"name", "freq_khz", "version"}）直接应用一条
+  微调建议：服务端先比对当前解析结果的版本标识，再按现有规则重算确认
+  该频率仍在建议集中，通过后只替换目标行频率，响应携带新清单文本与
+  ``applied`` 结果对象；版本不符或建议不可用时返回微调区（行号 -1）422。
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from pydantic import BaseModel, Field
 from .imd import (
     CANDIDATE_LINE,
     analyze,
+    apply_retune,
     build_summary,
     evaluate_candidate,
     evaluate_focus,
@@ -29,7 +35,9 @@ from .imd import (
     parse_candidate,
     parse_channels,
     parse_focus_channels,
+    parse_retune_apply,
     parse_retune_target,
+    validate_retune_apply,
 )
 
 app = FastAPI(title="无线话筒互调排查台 API", version="1.3.0")
@@ -67,6 +75,12 @@ class AnalyzeRequest(BaseModel):
     focus: object = Field(
         default=None,
         description="可选：一至三个重点频道名称列表，对现有冲突结果做聚焦排查",
+    )
+    # 应用微调建议：{name, freq_khz, version} 在业务层校验（结构错误同样按
+    # 微调区行号 -1 拒绝）；与 candidate/retune/focus 互斥，应用时忽略其余可选字段
+    apply: object = Field(
+        default=None,
+        description="可选：应用微调建议 {name, freq_khz, version}，只替换目标行频率",
     )
 
 
@@ -136,6 +150,18 @@ class RetuneOut(BaseModel):
     baseline_conflict_count: int
     # 按 冲突总数 → 移动距离 → 频率升序 稳定排名，最多 5 条；为空即范围内无改善
     suggestions: list[RetuneSuggestionOut]
+    # 生成建议时的清单版本标识（频道名称 + 整数 kHz + 顺序）：
+    # 应用建议时原样回传，服务端据此拒绝过期清单的旧建议
+    manifest_version: str
+
+
+class ApplyOut(BaseModel):
+    """一次成功应用微调建议的结果（只替换了目标行频率）。"""
+
+    name: str
+    freq_khz: int  # 实际应用的替换频率（整数 kHz）
+    version: str  # 应用成功后新清单的版本标识
+    applied_text: str  # 替换目标行频率后的清单文本（页面据此同步编辑区）
 
 
 class FocusEntryOut(BaseModel):
@@ -167,6 +193,8 @@ class AnalyzeResponse(BaseModel):
     retune: RetuneOut | None = None
     # 仅当请求携带聚焦参数时出现；未传聚焦参数时维持原有字段语义
     focus: FocusOut | None = None
+    # 仅当请求携带 apply 且应用成功时出现；其余请求维持原有字段语义
+    applied: ApplyOut | None = None
 
 
 class ErrorItem(BaseModel):
@@ -208,6 +236,50 @@ def analyze_endpoint(req: AnalyzeRequest):
         return JSONResponse(
             status_code=422,
             content={"errors": [{"line": e.line, "message": e.message} for e in errors]},
+        )
+
+    if req.apply is not None:
+        # 应用微调建议：先校验请求结构，再按当前清单重算版本与建议集，
+        # 任一步失败都返回微调区错误（line=-1）且不给出任何应用结果
+        name, freq_khz, version, apply_errors = parse_retune_apply(req.apply, channels)
+        if apply_errors:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "errors": [
+                        {"line": e.line, "message": e.message} for e in apply_errors
+                    ]
+                },
+            )
+        target, suggestion, apply_errors = validate_retune_apply(
+            channels, name, freq_khz, version
+        )
+        if apply_errors:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "errors": [
+                        {"line": e.line, "message": e.message} for e in apply_errors
+                    ]
+                },
+            )
+        # 校验通过：只替换目标行频率，对替换后的清单重算完整分析
+        applied = apply_retune(req.input, channels, target, suggestion)
+        return AnalyzeResponse(
+            channel_count=len(applied.applied_channels),
+            channels=[
+                ChannelOut(name=c.name, freq_khz=c.freq_khz, line=c.line)
+                for c in applied.applied_channels
+            ],
+            conflict_count=len(applied.conflicts),
+            conflicts=[_conflict_out(c) for c in applied.conflicts],
+            summary=build_summary(applied.applied_channels, applied.conflicts),
+            applied=ApplyOut(
+                name=applied.name,
+                freq_khz=applied.freq_khz,
+                version=applied.version,
+                applied_text=applied.applied_text,
+            ),
         )
 
     candidate_out = None
@@ -299,6 +371,7 @@ def analyze_endpoint(req: AnalyzeRequest):
                 )
                 for s in retune_eval.suggestions
             ],
+            manifest_version=retune_eval.version,
         )
         # 顶层 conflicts 始终是当前清单的完整冲突分组；
         # 微调建议只放在 retune 对象中，不写回清单、不改变旧字段语义。
