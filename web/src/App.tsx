@@ -7,6 +7,7 @@ import type {
   ConflictOut,
   ErrorItem,
   NewConflictOut,
+  RetuneOut,
 } from "./types";
 
 const EXAMPLE_INPUT = `# 每行一个频道：名称 频率(MHz)，470.000–694.000，最多三位小数
@@ -17,6 +18,8 @@ D 500.250`;
 
 /** 候选区错误固定使用行号 0（清单正文行号从 1 开始） */
 const CANDIDATE_AREA_LINE = 0;
+/** 微调区错误固定使用行号 -1 */
+const RETUNE_AREA_LINE = -1;
 
 interface ConflictGroup {
   targetName: string;
@@ -76,9 +79,11 @@ export default function App() {
   const [text, setText] = useState(EXAMPLE_INPUT);
   const [candidateName, setCandidateName] = useState("");
   const [candidateFreq, setCandidateFreq] = useState("");
+  const [retuneTarget, setRetuneTarget] = useState("");
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [errors, setErrors] = useState<ErrorItem[]>([]);
   const [candidateErrors, setCandidateErrors] = useState<ErrorItem[]>([]);
+  const [retuneErrors, setRetuneErrors] = useState<ErrorItem[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -92,30 +97,40 @@ export default function App() {
     [result],
   );
 
-  async function runAnalyze(withCandidate: boolean) {
+  async function runAnalyze(mode: "list" | "candidate" | "retune") {
     setLoading(true);
     setFatal(null);
     setCopied(false);
     try {
       const data = await analyze(
         text,
-        withCandidate ? { name: candidateName, freq: candidateFreq } : undefined,
+        mode === "candidate" ? { name: candidateName, freq: candidateFreq } : undefined,
+        mode === "retune" ? retuneTarget : undefined,
       );
       setResult(data);
       setErrors([]);
       setCandidateErrors([]);
+      setRetuneErrors([]);
     } catch (err) {
       if (err instanceof InputError) {
-        // 行号 0 专指候选输入区：错误只在候选区提示，且不覆盖上一次有效结果
-        const listErrors = err.errors.filter((e) => e.line !== CANDIDATE_AREA_LINE);
+        // 行号 0 专指候选输入区、-1 专指微调区：区域错误只在对应区域提示，
+        // 且不覆盖上一次有效结果；清单行号（≥1）错误整批拒绝
+        const listErrors = err.errors.filter((e) => e.line >= 1);
         const areaErrors = err.errors.filter((e) => e.line === CANDIDATE_AREA_LINE);
+        const tuneErrors = err.errors.filter((e) => e.line === RETUNE_AREA_LINE);
         if (listErrors.length > 0) {
           setErrors(listErrors);
           setCandidateErrors([]);
+          setRetuneErrors([]);
           setResult(null); // 清单非法：整批拒绝，不展示任何风险结果
+        } else if (tuneErrors.length > 0) {
+          setRetuneErrors(tuneErrors);
+          setErrors([]);
+          setCandidateErrors([]);
         } else {
           setCandidateErrors(areaErrors);
           setErrors([]);
+          setRetuneErrors([]);
         }
       } else {
         setFatal(err instanceof Error ? err.message : "未知错误");
@@ -127,11 +142,15 @@ export default function App() {
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    void runAnalyze(false);
+    void runAnalyze("list");
   }
 
   function onTryAdd() {
-    void runAnalyze(true);
+    void runAnalyze("candidate");
+  }
+
+  function onRetune() {
+    void runAnalyze("retune");
   }
 
   async function copySummary() {
@@ -153,6 +172,7 @@ export default function App() {
   }
 
   const candidate: CandidateOut | undefined = result?.candidate;
+  const retune: RetuneOut | undefined = result?.retune;
 
   return (
     <main className="page">
@@ -245,6 +265,23 @@ export default function App() {
             {candidateErrors.map((e, i) => (
               <li key={i}>
                 <span className="line-badge">候选输入区</span>
+                {e.message}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {retuneErrors.length > 0 && (
+        <section className="panel error-panel retune-error-panel" role="alert">
+          <h2>
+            微调频道选择有误（{retuneErrors.length} 项）
+            {result ? "，已保留当前分析结果" : "，请重新选择"}
+          </h2>
+          <ul className="error-list">
+            {retuneErrors.map((e, i) => (
+              <li key={i}>
+                <span className="line-badge">微调区</span>
                 {e.message}
               </li>
             ))}
@@ -393,6 +430,72 @@ export default function App() {
               ))}
             </article>
           )}
+
+          <div className="retune-box">
+            <div className="retune-controls">
+              <h3>微调频点</h3>
+              <label htmlFor="retune-target">微调频道</label>
+              <select
+                id="retune-target"
+                value={retuneTarget}
+                onChange={(e) => setRetuneTarget(e.target.value)}
+              >
+                <option value="">请选择要微调的频道</option>
+                {result.channels.map((c) => (
+                  <option key={c.name} value={c.name}>
+                    {c.name}（{formatMhz(c.freq_khz)} MHz）
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="secondary"
+                disabled={loading || !retuneTarget}
+                onClick={onRetune}
+              >
+                {loading ? "查找中…" : "查找微调频点"}
+              </button>
+            </div>
+            <p className="hint">
+              在原频率 ±500 kHz 内按 25 kHz 步长枚举合法且未占用的频点，最多 5
+              条建议；建议仅作参考，不会自动写回清单。
+            </p>
+
+            {retune && (
+              <div className="retune-result" role="status">
+                <h4>
+                  {retune.name}（当前 {formatMhz(retune.original_freq_khz)} MHz，当前冲突{" "}
+                  {retune.baseline_conflict_count} 项）
+                </h4>
+                {retune.suggestions.length === 0 ? (
+                  <p className="retune-empty">
+                    范围内无改善：±500 kHz 内没有能减少冲突的替换频点。
+                  </p>
+                ) : (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>替换频率</th>
+                        <th>移动量</th>
+                        <th>替换后冲突</th>
+                        <th>减少</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {retune.suggestions.map((s) => (
+                        <tr key={s.freq_khz}>
+                          <td>{formatMhz(s.freq_khz)} MHz</td>
+                          <td>{s.move_khz} kHz</td>
+                          <td>{s.conflict_count} 项</td>
+                          <td>−{s.reduced_count} 项</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
+          </div>
 
           <div className="summary-header">
             <h3>可复制摘要</h3>

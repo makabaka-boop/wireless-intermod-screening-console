@@ -12,6 +12,10 @@
    重复/越界候选被拒绝且错误指向候选输入区、旧请求（不带候选）语义不变；
    候选仅作产物来源时受影响名单仍含候选自身、非对象候选值与井号开头
    名称均按候选输入区（行号 0）拒绝。
+9. 微调频点：多个改善频点按（冲突总数，移动距离，频率升序）稳定排名且
+   字段可复算、±500 kHz 与带缘边界候选参与计算、无改善返回空建议、
+   未知微调频道指向微调区（行号 -1）且不影响既有结果、
+   未携带微调参数的旧请求语义不变。
 """
 
 from __future__ import annotations
@@ -55,10 +59,12 @@ def wait_ready() -> None:
     raise RuntimeError(f"等待 {API} 就绪超时（{TIMEOUT}s）")
 
 
-def analyze(text: str, candidate: dict | None = None) -> httpx.Response:
+def analyze(text: str, candidate: dict | None = None, retune: str | None = None) -> httpx.Response:
     payload = {"input": text}
     if candidate is not None:
         payload["candidate"] = candidate
+    if retune is not None:
+        payload["retune"] = retune
     return httpx.post(f"{API}/api/analyze", json=payload, timeout=10)
 
 
@@ -342,16 +348,170 @@ def main() -> int:
             f"旧字段集合被改变: {set(data.keys())}",
         )
 
+    def t_retune_finds_and_stably_orders_improvements():
+        resp = analyze("A 500.000\nB 500.100\nC 499.850\nD 500.250", retune="A")
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        data = resp.json()
+        # 顶层仍是当前清单的完整冲突分组，建议不写回清单
+        expect(data["conflict_count"] == 4, "顶层冲突应保持基线 4 项")
+        expect(
+            [c["freq_khz"] for c in data["channels"]]
+            == [500_000, 500_100, 499_850, 500_250],
+            "微调建议不得写回清单",
+        )
+        ret = data.get("retune")
+        expect(bool(ret), "携带微调参数时响应必须包含 retune 评估对象")
+        expect(
+            ret["name"] == "A" and ret["original_freq_khz"] == 500_000,
+            f"微调目标不符: {ret}",
+        )
+        expect(ret["baseline_conflict_count"] == 4, "基线冲突数应为 4")
+        suggestions = ret["suggestions"]
+        expect(2 <= len(suggestions) <= 5, f"应找到多条（≤5）改善频点: {len(suggestions)}")
+        got = [
+            (s["freq_khz"], s["move_khz"], s["conflict_count"], s["reduced_count"])
+            for s in suggestions
+        ]
+        expect(
+            got
+            == [
+                (499_875, 125, 0, 4),
+                (500_125, 125, 0, 4),  # 移动距离相同，按频率升序打破平局
+                (499_825, 175, 0, 4),
+                (499_800, 200, 0, 4),
+                (499_775, 225, 0, 4),
+            ],
+            f"建议内容或稳定排序不符: {got}",
+        )
+        keys = [(s["conflict_count"], s["move_khz"], s["freq_khz"]) for s in suggestions]
+        expect(keys == sorted(keys), "建议应按 冲突总数→移动距离→频率升序 稳定排名")
+        # 字段自洽，且每条建议都可用接口独立复算验证
+        for s in suggestions:
+            expect(s["move_khz"] == abs(s["freq_khz"] - 500_000), "移动量应为 |新频点−原频点|")
+            expect(
+                s["reduced_count"] == 4 - s["conflict_count"],
+                "减少数量应等于 基线冲突数 − 替换后冲突数",
+            )
+            expect(
+                (s["freq_khz"] - 500_000) % 25 == 0
+                and 499_500 <= s["freq_khz"] <= 500_500
+                and s["freq_khz"] != 500_000,
+                f"频点应落在 ±500 kHz、25 kHz 网格上且非原位: {s}",
+            )
+            replaced = "\n".join(
+                f"A {s['freq_khz'] // 1000}.{s['freq_khz'] % 1000:03d}"
+                if line.startswith("A ")
+                else line
+                for line in ["A 500.000", "B 500.100", "C 499.850", "D 500.250"]
+            )
+            again = analyze(replaced).json()
+            expect(
+                again["conflict_count"] == s["conflict_count"],
+                f"替换后复算冲突数与建议不符: {s}",
+            )
+
+    def t_retune_edge_candidates_participate():
+        # CH3 的 +500 kHz 边界候选（595.275）恰为改善方案：少枚举一步就会漏掉
+        resp = analyze(
+            "CH0 593.975\nCH1 594.550\nCH2 594.675\nCH3 594.775\nCH4 594.800\nCH5 595.450",
+            retune="CH3",
+        )
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        suggestions = resp.json()["retune"]["suggestions"]
+        got = [(s["freq_khz"], s["move_khz"], s["conflict_count"]) for s in suggestions]
+        expect(
+            got
+            == [
+                (595_200, 425, 2),
+                (595_225, 450, 2),
+                (595_250, 475, 2),
+                (595_275, 500, 2),  # 恰好 +500 kHz 的边界候选
+            ],
+            f"±500 kHz 边界候选应参与计算: {got}",
+        )
+        # 带缘 470.000 MHz 本身也可作为替换频点并排在首位
+        resp = analyze("CH0 470.100\nCH1 470.400\nCH2 470.725\nCH3 471.300", retune="CH0")
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        suggestions = resp.json()["retune"]["suggestions"]
+        expect(bool(suggestions), "带缘场景应给出建议")
+        expect(
+            suggestions[0]["freq_khz"] == 470_000
+            and suggestions[0]["conflict_count"] == 0,
+            f"带缘 470.000 应作为首选替换频点: {suggestions[0]}",
+        )
+        expect(
+            all(470_000 <= s["freq_khz"] <= 694_000 for s in suggestions),
+            "不得给出带外频点",
+        )
+
+    def t_retune_no_improvement_returns_empty():
+        # E 与任何冲突无关：±500 kHz 内没有更优方案
+        resp = analyze("A 500.000\nB 500.100\nC 499.850\nD 500.250\nE 600.000", retune="E")
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        ret = resp.json()["retune"]
+        expect(ret["baseline_conflict_count"] == 4, "基线冲突数应为 4")
+        expect(ret["suggestions"] == [], f"无改善时建议应为空: {ret['suggestions']}")
+        # 安全清单同样不可能再改善
+        resp = analyze("C1 500.000\nC2 510.000\nC3 530.000", retune="C1")
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        expect(resp.json()["retune"]["suggestions"] == [], "安全清单建议应为空")
+
+    def t_retune_unknown_channel_points_to_retune_area():
+        resp = analyze("A 500.000\nB 500.100\nC 499.850\nD 500.250", retune="ZZ")
+        expect(resp.status_code == 422, f"未知微调频道应 422，实际 {resp.status_code}")
+        data = resp.json()
+        expect("conflicts" not in data, "微调频道非法时不得给出风险结果")
+        errors = data["errors"]
+        expect(
+            errors and all(e["line"] == -1 for e in errors),
+            f"微调错误须指向微调区(line=-1): {errors}",
+        )
+        expect("ZZ" in errors[0]["message"], "错误信息应包含所填名称")
+        # 非字符串微调值同样指向微调区，不得误报清单第 1 行
+        resp = httpx.post(
+            f"{API}/api/analyze",
+            json={"input": "A 500.000\nB 500.100", "retune": 123},
+            timeout=10,
+        )
+        expect(resp.status_code == 422, f"非字符串微调值应 422，实际 {resp.status_code}")
+        expect(
+            all(e["line"] == -1 for e in resp.json()["errors"]),
+            "非字符串微调值应指向微调区(line=-1)",
+        )
+
+    def t_retune_invalid_list_rejected_with_original_line_numbers():
+        # 清单非法时仍按原行号整批拒绝，不评估微调、不给部分结果
+        resp = analyze("CH1 500.0005\nCH2 469.000", retune="CH1")
+        expect(resp.status_code == 422, f"应 422，实际 {resp.status_code}")
+        data = resp.json()
+        expect("conflicts" not in data, "不得给出部分风险结果")
+        expect([e["line"] for e in data["errors"]] == [1, 2], "清单非法须按原行号整批拒绝")
+
+    def t_legacy_request_without_retune_unchanged():
+        # 未携带微调参数的请求：响应字段与旧版逐字段一致（无 retune 键）
+        resp = analyze("A 500.000\nB 500.100\nC 499.850\nD 500.250")
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        data = resp.json()
+        expect("retune" not in data, "旧请求响应中不应出现 retune 字段")
+        expect(
+            set(data.keys())
+            == {"channel_count", "channels", "conflict_count", "conflicts", "summary"},
+            f"旧字段集合被改变: {set(data.keys())}",
+        )
+
     def t_web_page_served():
         resp = httpx.get(f"{WEB}/", timeout=10, follow_redirects=True)
         expect(resp.status_code == 200, f"Web HTTP {resp.status_code}")
         expect("无线话筒互调排查台" in resp.text, "首页应包含应用标题")
-        # 候选试加入口由 React 渲染，确认其已打进 JS bundle
+        # 候选试加与微调频点入口由 React 渲染，确认其已打进 JS bundle
         assets = re.findall(r'src="([^"]+\.js)"', resp.text)
         expect(bool(assets), f"首页应引用 JS bundle: {resp.text[:200]}")
         bundle = httpx.get(f"{WEB}{assets[0]}", timeout=10).text
         expect("试加频道" in bundle, "JS bundle 应包含候选试加按钮")
         expect("候选输入区" in bundle, "JS bundle 应包含候选错误定位提示")
+        expect("查找微调频点" in bundle, "JS bundle 应包含微调频点按钮")
+        expect("范围内无改善" in bundle, "JS bundle 应包含微调无改善提示")
+        expect("微调区" in bundle, "JS bundle 应包含微调错误定位提示")
 
     def t_web_proxy_to_api():
         # 通过 web 容器的 /api 反代提交，验证联调链路真实可用
@@ -380,6 +540,24 @@ def main() -> int:
         expect(bool(cand) and cand["status"] == "risky", "反代候选评估应为 risky")
         expect(cand["new_conflict_count"] == 6, f"应新增 6 项: {cand and cand['new_conflict_count']}")
 
+    def t_web_proxy_retune():
+        # 页面的微调频点查询同样经 /api 反代到真实接口
+        resp = httpx.post(
+            f"{WEB}/api/analyze",
+            json={"input": "A 500.000\nB 500.100\nC 499.850\nD 500.250", "retune": "A"},
+            timeout=10,
+        )
+        expect(resp.status_code == 200, f"经反代微调失败: HTTP {resp.status_code}")
+        data = resp.json()
+        expect(data["conflict_count"] == 4, "顶层结果应保持基线 4 项")
+        ret = data.get("retune")
+        expect(bool(ret) and ret["name"] == "A", "反代微调应返回 retune 评估对象")
+        expect(
+            len(ret["suggestions"]) == 5
+            and ret["suggestions"][0]["freq_khz"] == 499_875,
+            f"反代微调建议不符: {ret and ret['suggestions']}",
+        )
+
     checks = [
         ("API 健康检查", t_health),
         ("保护带边界：恰好 50 kHz 稳定命中", t_boundary_50khz_hit),
@@ -399,9 +577,16 @@ def main() -> int:
         ("候选试加：井号开头名称与清单口径一致被拒", t_hash_prefix_candidate_name_rejected),
         ("候选试加：清单非法仍按原行号整批拒绝", t_invalid_list_rejected_even_with_candidate),
         ("不带候选的旧请求维持原字段语义", t_legacy_request_without_candidate_unchanged),
+        ("微调频点：多个改善频点稳定排序且可复算", t_retune_finds_and_stably_orders_improvements),
+        ("微调频点：±500 kHz 与带缘边界候选参与计算", t_retune_edge_candidates_participate),
+        ("微调频点：无改善时返回空建议", t_retune_no_improvement_returns_empty),
+        ("微调频点：未知/非法微调频道指向微调区", t_retune_unknown_channel_points_to_retune_area),
+        ("微调频点：清单非法仍按原行号整批拒绝", t_retune_invalid_list_rejected_with_original_line_numbers),
+        ("不带微调参数的旧请求维持原字段语义", t_legacy_request_without_retune_unchanged),
         ("Web 页面可访问", t_web_page_served),
         ("Web /api 反代联调链路", t_web_proxy_to_api),
         ("Web /api 反代候选试加链路", t_web_proxy_candidate_trial),
+        ("Web /api 反代微调频点链路", t_web_proxy_retune),
     ]
     for name, fn in checks:
         check(name, fn)

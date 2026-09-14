@@ -40,6 +40,27 @@ export interface CandidateOut {
   affected_channel_names: string[];
 }
 
+/** 微调频点：单条替换建议（均严格优于当前清单） */
+export interface RetuneSuggestionOut {
+  /** 替换频率（整数 kHz） */
+  freq_khz: number;
+  /** 相对原频率的移动量（kHz，绝对值） */
+  move_khz: number;
+  /** 替换后整表冲突总数 */
+  conflict_count: number;
+  /** 相对当前清单减少的冲突数 */
+  reduced_count: number;
+}
+
+/** 微调频点评估（仅携带 retune 的请求返回） */
+export interface RetuneOut {
+  name: string;
+  original_freq_khz: number;
+  baseline_conflict_count: number;
+  /** 按 冲突总数 → 移动距离 → 频率升序 稳定排名，最多 5 条；为空即范围内无改善 */
+  suggestions: RetuneSuggestionOut[];
+}
+
 export interface AnalyzeResponse {
   channel_count: number;
   channels: ChannelOut[];
@@ -47,6 +68,7 @@ export interface AnalyzeResponse {
   conflicts: ConflictOut[];
   summary: string;
   candidate?: CandidateOut;
+  retune?: RetuneOut;
 }
 
 export interface ErrorItem {

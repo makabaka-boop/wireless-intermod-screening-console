@@ -17,6 +17,14 @@
 （目标频道，产物频率，来源组合）构成的稳定键比较两次结果，
 单独标出候选加入后才出现的冲突及受影响频道。候选本身的输入错误
 使用 :data:`CANDIDATE_LINE`（0）作为行号，与清单正文的行号区分。
+
+微调频点（演出前微调已登记话筒）：
+``evaluate_retune`` 在目标频道原频率上下 500 kHz 内按 25 kHz 步长枚举
+合法（频段内）且未被其他频道占用的替换频点，复用 :func:`analyze`
+重新计算整表冲突，仅保留冲突总数严格优于当前清单的方案，
+按（冲突总数，移动距离，频率升序）稳定排名，最多返回
+:data:`RETUNE_MAX_SUGGESTIONS` 条建议；建议只作展示，不写回清单。
+微调区错误使用 :data:`RETUNE_LINE`（-1）作为行号。
 """
 
 from __future__ import annotations
@@ -32,6 +40,13 @@ MAX_CHANNELS = 32
 
 # 候选输入区错误的固定行号（清单正文行号从 1 开始，0 专指候选区）
 CANDIDATE_LINE = 0
+
+# 微调频点：原频率上下 500 kHz、25 kHz 步长、最多 5 条建议
+RETUNE_RANGE_KHZ = 500
+RETUNE_STEP_KHZ = 25
+RETUNE_MAX_SUGGESTIONS = 5
+# 微调区错误的固定行号（-1 专指微调区，与清单行号、候选区行号区分）
+RETUNE_LINE = -1
 
 # 名称中不允许出现的分隔字符：空白、英文逗号、中文逗号（与清单两列分隔口径一致）
 NAME_SEPARATOR_PATTERN = re.compile(r"[\s,，]")
@@ -402,4 +417,104 @@ def evaluate_candidate(channels: list[Channel], candidate: Channel) -> Candidate
         merged_conflicts=merged,
         new_conflicts=new_conflicts,
         affected_channel_names=sorted(affected),
+    )
+
+
+@dataclass
+class RetuneSuggestion:
+    """一条微调替换建议（均严格优于当前清单）。"""
+
+    freq_khz: int  # 替换频率（整数 kHz）
+    move_khz: int  # 相对原频率的移动量（kHz，绝对值）
+    conflict_count: int  # 替换后整表冲突总数
+    reduced_count: int  # 相对当前清单减少的冲突数
+
+
+@dataclass
+class RetuneEvaluation:
+    """微调频点评估结果；``suggestions`` 为空表示范围内无改善。"""
+
+    name: str
+    original_freq_khz: int
+    baseline_conflicts: list[Conflict]  # 当前清单的完整冲突分组
+    # 按（冲突总数，移动距离，频率升序）稳定排名，最多 RETUNE_MAX_SUGGESTIONS 条
+    suggestions: list[RetuneSuggestion]
+
+    @property
+    def baseline_conflict_count(self) -> int:
+        return len(self.baseline_conflicts)
+
+
+def parse_retune_target(
+    name: object, channels: list[Channel]
+) -> tuple[Channel | None, list[InputError]]:
+    """校验微调目标频道名称，返回清单中已登记的对应频道。
+
+    微调区错误固定指向 :data:`RETUNE_LINE`，与清单正文行号、候选区行号区分；
+    名称不存在时不影响调用方保留上一次有效分析结果。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None, [
+            InputError(
+                RETUNE_LINE,
+                "微调频道缺失：请从分析结果关联的频道中选择要微调的话筒",
+            )
+        ]
+    stripped = name.strip()
+    for c in channels:
+        if c.name == stripped:
+            return c, []
+    return None, [
+        InputError(
+            RETUNE_LINE,
+            f"微调频道「{stripped}」不在当前清单中，请从分析结果关联的频道中选择",
+        )
+    ]
+
+
+def evaluate_retune(channels: list[Channel], target: Channel) -> RetuneEvaluation:
+    """在目标频道原频率 ±500 kHz 内按 25 kHz 步长枚举替换频点。
+
+    只保留合法（仍在 470.000–694.000 MHz 频段内，含两端边界候选）且未被
+    其他频道占用的频点；对每个候选频点复用 :func:`analyze` 重算整表冲突，
+    仅保留冲突总数严格少于当前清单的方案，按（冲突总数，移动距离，频率升序）
+    稳定排名，最多返回 :data:`RETUNE_MAX_SUGGESTIONS` 条。建议只作展示，
+    不写回清单。
+    """
+    baseline = analyze(channels)
+    baseline_count = len(baseline)
+    occupied = {c.freq_khz for c in channels if c.name != target.name}
+
+    suggestions: list[RetuneSuggestion] = []
+    start = target.freq_khz - RETUNE_RANGE_KHZ
+    stop = target.freq_khz + RETUNE_RANGE_KHZ
+    # range 上界再进一步，保证 ±500 kHz 的边界候选也参与计算
+    for freq in range(start, stop + RETUNE_STEP_KHZ, RETUNE_STEP_KHZ):
+        if freq == target.freq_khz:
+            continue  # 原位不算微调
+        if not MIN_KHZ <= freq <= MAX_KHZ:
+            continue  # 只保留频段内的合法频点
+        if freq in occupied:
+            continue  # 已被其他频道占用
+        replaced = [
+            Channel(c.name, freq, c.line) if c.name == target.name else c
+            for c in channels
+        ]
+        count = len(analyze(replaced))
+        if count < baseline_count:
+            suggestions.append(
+                RetuneSuggestion(
+                    freq_khz=freq,
+                    move_khz=abs(freq - target.freq_khz),
+                    conflict_count=count,
+                    reduced_count=baseline_count - count,
+                )
+            )
+
+    suggestions.sort(key=lambda s: (s.conflict_count, s.move_khz, s.freq_khz))
+    return RetuneEvaluation(
+        name=target.name,
+        original_freq_khz=target.freq_khz,
+        baseline_conflicts=baseline,
+        suggestions=suggestions[:RETUNE_MAX_SUGGESTIONS],
     )

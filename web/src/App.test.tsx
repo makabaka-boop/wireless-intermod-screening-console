@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { AnalyzeResponse, CandidateOut } from "./types";
+import type { AnalyzeResponse, CandidateOut, RetuneOut } from "./types";
 
 const CONFLICT_RESPONSE: AnalyzeResponse = {
   channel_count: 4,
@@ -132,6 +132,36 @@ const SAFE_CANDIDATE: CandidateOut = {
 function fillCandidate(name: string, freq: string) {
   fireEvent.change(screen.getByLabelText(/候选名称/), { target: { value: name } });
   fireEvent.change(screen.getByLabelText(/候选频率/), { target: { value: freq } });
+}
+
+const RETUNE_RESULT: RetuneOut = {
+  name: "A",
+  original_freq_khz: 500_000,
+  baseline_conflict_count: 4,
+  suggestions: [
+    { freq_khz: 499_875, move_khz: 125, conflict_count: 0, reduced_count: 4 },
+    { freq_khz: 500_125, move_khz: 125, conflict_count: 0, reduced_count: 4 },
+    { freq_khz: 499_825, move_khz: 175, conflict_count: 0, reduced_count: 4 },
+  ],
+};
+
+const RETUNE_RESPONSE: AnalyzeResponse = {
+  ...CONFLICT_RESPONSE,
+  retune: RETUNE_RESULT,
+};
+
+const RETUNE_EMPTY_RESPONSE: AnalyzeResponse = {
+  ...CONFLICT_RESPONSE,
+  retune: {
+    name: "A",
+    original_freq_khz: 500_000,
+    baseline_conflict_count: 4,
+    suggestions: [],
+  },
+};
+
+function selectRetuneTarget(name: string) {
+  fireEvent.change(screen.getByLabelText("微调频道"), { target: { value: name } });
 }
 
 beforeEach(() => {
@@ -390,5 +420,153 @@ describe("候选试加", () => {
     const [, init2] = fetchMock.mock.calls[1];
     expect(JSON.parse(init2.body)).toEqual({ input: "C1 500.000\nC2 510.000" });
     expect(screen.queryByText(/试加有风险/)).not.toBeInTheDocument();
+  });
+});
+
+describe("微调频点", () => {
+  it("选择频道后点击查找微调频点，展示建议且保留当前冲突分组，不写回清单", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const listInput = "A 500.000\nB 500.100\nC 499.850\nD 500.250";
+    submitForm(listInput);
+    await screen.findByText(/发现 4 项冲突/);
+
+    // 从分析结果关联的频道中选择一个并查找微调频点
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toBe("/api/analyze");
+    expect(JSON.parse(init.body)).toEqual({ input: listInput, retune: "A" });
+
+    // 建议表：替换频率、移动量、替换后冲突数、减少数量
+    expect(await screen.findByText("499.875 MHz")).toBeInTheDocument();
+    expect(screen.getByText("500.125 MHz")).toBeInTheDocument();
+    expect(screen.getAllByText("125 kHz").length).toBe(2);
+    expect(screen.getAllByText("−4 项").length).toBe(3);
+    expect(screen.getByText(/当前 500\.000 MHz，当前冲突 4 项/)).toBeInTheDocument();
+
+    // 当前冲突分组原样保留
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    // 建议不写回清单输入框
+    expect(screen.getByLabelText(/频道清单/)).toHaveValue(listInput);
+  });
+
+  it("无改善时明确显示范围内无改善", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => RETUNE_EMPTY_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+
+    expect(await screen.findByText(/范围内无改善/)).toBeInTheDocument();
+    // 冲突分组仍然保留
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+  });
+
+  it("微调频道不存在时错误定位到微调区，且不清空既有分析结果", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [
+            { line: -1, message: "微调频道「A」不在当前清单中，请从分析结果关联的频道中选择" },
+          ],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    // 提交后改掉清单文本（移除 A），再基于上一次结果发起微调
+    fireEvent.change(screen.getByLabelText(/频道清单/), {
+      target: { value: "B 500.100\nC 499.850\nD 500.250" },
+    });
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+
+    expect(
+      await screen.findByText(/微调频道选择有误（1 项），已保留当前分析结果/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("微调区")).toBeInTheDocument();
+    expect(screen.getByText(/微调频道「A」不在当前清单中/)).toBeInTheDocument();
+    // 既有分析结果（冲突分组）仍然保留
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+    // 不混入清单错误面板与候选错误面板
+    expect(screen.queryByText(/输入有误/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/候选输入有误/)).not.toBeInTheDocument();
+  });
+
+  it("清单非法时仍按原行号整批拒绝并清空结果，即使点的是查找微调频点", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [{ line: 1, message: "频率「500.0005」非法：需为最多三位小数的 MHz 数值" }],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    fireEvent.change(screen.getByLabelText(/频道清单/), {
+      target: { value: "CH1 500.0005" },
+    });
+    selectRetuneTarget("A");
+    fireEvent.click(screen.getByRole("button", { name: /查找微调频点/ }));
+
+    expect(await screen.findByText(/输入有误（1 项）/)).toBeInTheDocument();
+    expect(screen.getByText("第 1 行")).toBeInTheDocument();
+    expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/微调频道选择有误/)).not.toBeInTheDocument();
   });
 });

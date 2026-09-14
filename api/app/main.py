@@ -4,7 +4,9 @@
 - GET  /api/health   健康检查
 - POST /api/analyze  提交频道清单文本，返回冲突分析或带行号的全部输入错误；
   请求体可选携带 ``candidate``（{"name", "freq"}）进行彩排试加评估，
-  响应在保留基线字段语义的同时增加 ``candidate`` 评估对象。
+  响应在保留基线字段语义的同时增加 ``candidate`` 评估对象；
+  亦可携带 ``retune``（已登记频道名称）获取该频道 ±500 kHz 内的
+  微调频点建议，响应增加 ``retune`` 评估对象。
 """
 
 from __future__ import annotations
@@ -20,11 +22,13 @@ from .imd import (
     analyze,
     build_summary,
     evaluate_candidate,
+    evaluate_retune,
     parse_candidate,
     parse_channels,
+    parse_retune_target,
 )
 
-app = FastAPI(title="无线话筒互调排查台 API", version="1.1.0")
+app = FastAPI(title="无线话筒互调排查台 API", version="1.2.0")
 
 # 开发联调允许跨域；生产部署由 web 容器的 nginx 反向代理 /api，同源访问
 app.add_middleware(
@@ -47,6 +51,12 @@ class AnalyzeRequest(BaseModel):
     # 错误（行号 0）拒绝，不能落入请求体验证异常而误报为清单第 1 行
     candidate: object = Field(
         default=None, description="可选：试加候选频道 {name, freq}，不写入正式清单"
+    )
+    # 微调频道名称同样在业务层校验：非字符串或未在清单中登记的名称必须按
+    # 微调区错误（行号 -1）拒绝，不能误报为清单第 1 行的技术性错误
+    retune: object = Field(
+        default=None,
+        description="可选：微调目标频道名称，返回原频率 ±500 kHz 内的替换频点建议",
     )
 
 
@@ -103,6 +113,21 @@ class CandidateOut(BaseModel):
     affected_channel_names: list[str]
 
 
+class RetuneSuggestionOut(BaseModel):
+    freq_khz: int  # 替换频率（整数 kHz）
+    move_khz: int  # 相对原频率的移动量（kHz，绝对值）
+    conflict_count: int  # 替换后整表冲突总数
+    reduced_count: int  # 相对当前清单减少的冲突数
+
+
+class RetuneOut(BaseModel):
+    name: str
+    original_freq_khz: int
+    baseline_conflict_count: int
+    # 按 冲突总数 → 移动距离 → 频率升序 稳定排名，最多 5 条；为空即范围内无改善
+    suggestions: list[RetuneSuggestionOut]
+
+
 class AnalyzeResponse(BaseModel):
     channel_count: int
     channels: list[ChannelOut]
@@ -111,6 +136,8 @@ class AnalyzeResponse(BaseModel):
     summary: str
     # 仅当请求携带候选时出现；未传候选时维持原有字段语义
     candidate: CandidateOut | None = None
+    # 仅当请求携带微调参数时出现；未传微调参数时维持原有字段语义
+    retune: RetuneOut | None = None
 
 
 class ErrorItem(BaseModel):
@@ -140,7 +167,7 @@ def _conflict_out(c) -> ConflictOut:
 @app.post(
     "/api/analyze",
     response_model=AnalyzeResponse,
-    # 未传候选时响应中不出现 candidate 字段，严格维持旧版字段语义
+    # 未传候选/微调参数时响应中不出现对应字段，严格维持旧版字段语义
     response_model_exclude_none=True,
     responses={422: {"model": ErrorResponse, "description": "输入校验失败"}},
 )
@@ -155,6 +182,7 @@ def analyze_endpoint(req: AnalyzeRequest):
         )
 
     candidate_out = None
+    conflicts = None
     if req.candidate is not None:
         if not isinstance(req.candidate, dict):
             # 非对象形式的候选值：明确标记候选输入区（行号 0），
@@ -213,7 +241,42 @@ def analyze_endpoint(req: AnalyzeRequest):
         # 顶层 conflicts 始终是当前展示清单（基线）的完整冲突分组；
         # 候选试加的合并结果只放在 candidate 对象中，不改变旧字段语义。
         conflicts = evaluation.baseline_conflicts
-    else:
+
+    retune_out = None
+    if req.retune is not None:
+        target, retune_errors = parse_retune_target(req.retune, channels)
+        if retune_errors:
+            # 微调区错误固定 line=-1，前端可据此只在微调区提示，
+            # 且不清空上一次有效分析结果
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "errors": [
+                        {"line": e.line, "message": e.message} for e in retune_errors
+                    ]
+                },
+            )
+        retune_eval = evaluate_retune(channels, target)
+        retune_out = RetuneOut(
+            name=retune_eval.name,
+            original_freq_khz=retune_eval.original_freq_khz,
+            baseline_conflict_count=retune_eval.baseline_conflict_count,
+            suggestions=[
+                RetuneSuggestionOut(
+                    freq_khz=s.freq_khz,
+                    move_khz=s.move_khz,
+                    conflict_count=s.conflict_count,
+                    reduced_count=s.reduced_count,
+                )
+                for s in retune_eval.suggestions
+            ],
+        )
+        # 顶层 conflicts 始终是当前清单的完整冲突分组；
+        # 微调建议只放在 retune 对象中，不写回清单、不改变旧字段语义。
+        if conflicts is None:
+            conflicts = retune_eval.baseline_conflicts
+
+    if conflicts is None:
         conflicts = analyze(channels)
 
     return AnalyzeResponse(
@@ -223,4 +286,5 @@ def analyze_endpoint(req: AnalyzeRequest):
         conflicts=[_conflict_out(c) for c in conflicts],
         summary=build_summary(channels, conflicts),
         candidate=candidate_out,
+        retune=retune_out,
     )

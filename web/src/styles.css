@@ -317,6 +317,72 @@ th {
   white-space: nowrap;
 }
 
+.retune-box {
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 12px;
+}
+
+.retune-controls {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.retune-controls h3 {
+  font-size: 15px;
+  margin: 0 8px 0 0;
+}
+
+.retune-controls label {
+  font-size: 14px;
+}
+
+select {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  padding: 8px 10px;
+}
+
+select:focus {
+  outline: 2px solid var(--accent);
+}
+
+.retune-controls button {
+  margin-top: 0;
+}
+
+.retune-box .hint {
+  margin: 8px 0 0;
+}
+
+.retune-result {
+  margin-top: 10px;
+}
+
+.retune-result h4 {
+  font-size: 14px;
+  margin: 4px 0 8px;
+}
+
+.retune-empty {
+  background: rgba(77, 163, 255, 0.08);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  font-size: 14px;
+  margin: 0;
+  padding: 10px 14px;
+}
+
+.retune-error-panel h2 {
+  font-size: 14px;
+}
+
 .summary-header {
   align-items: center;
   border-top: 1px solid var(--border);
