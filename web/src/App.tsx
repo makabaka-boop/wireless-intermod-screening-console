@@ -173,6 +173,10 @@ export default function App() {
   }
 
   function toggleFocus(name: string) {
+    // 改选即意味着当前展示的聚焦结果（或聚焦区错误）对应的是上一次选择：
+    // 立即隐藏旧结果并清除错误，避免旧条目冒充当前选择，也让超限纠正即时生效
+    setFocusErrors([]);
+    setResult((prev) => (prev?.focus ? { ...prev, focus: undefined } : prev));
     setFocusNames((prev) =>
       prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name],
     );
@@ -180,6 +184,13 @@ export default function App() {
 
   function onFocus() {
     void runAnalyze("focus");
+  }
+
+  /** 清单文本一旦被编辑，基于旧清单算出的聚焦结果即失效（名称/频率可能已改） */
+  function onListChange(value: string) {
+    setText(value);
+    setFocusErrors([]);
+    setResult((prev) => (prev?.focus ? { ...prev, focus: undefined } : prev));
   }
 
   async function copySummary() {
@@ -223,7 +234,7 @@ export default function App() {
               rows={10}
               spellCheck={false}
               value={text}
-              onChange={(e) => setText(e.target.value)}
+              onChange={(e) => onListChange(e.target.value)}
             />
           </div>
           <aside className="candidate-box" aria-label="候选试加区">
@@ -395,16 +406,21 @@ export default function App() {
           <div className="focus-box">
             <div className="focus-controls">
               <h3>聚焦排查</h3>
-              {result.channels.map((c) => (
-                <label className="focus-option" key={c.name}>
-                  <input
-                    type="checkbox"
-                    checked={focusNames.includes(c.name)}
-                    onChange={() => toggleFocus(c.name)}
-                  />
-                  {c.name}（{formatMhz(c.freq_khz)} MHz）
-                </label>
-              ))}
+              {result.channels.map((c) => {
+                const checked = focusNames.includes(c.name);
+                // 已选满三个时，其余频道禁止再勾选；已勾选项仍可取消
+                return (
+                  <label className="focus-option" key={c.name}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={!checked && focusNames.length >= 3}
+                      onChange={() => toggleFocus(c.name)}
+                    />
+                    {c.name}（{formatMhz(c.freq_khz)} MHz）
+                  </label>
+                );
+              })}
               <button
                 type="button"
                 className="secondary"
@@ -415,8 +431,10 @@ export default function App() {
               </button>
             </div>
             <p className="hint">
-              勾选一至三个重点频道（如主持人、主唱话筒），在顶部优先展示与之相关的冲突条目；
+              勾选一至三个重点频道（如主持人、主唱话筒，最多 3
+              个，已选满时其余频道不可再勾选），在顶部优先展示与之相关的冲突条目；
               完整冲突分组与可复制摘要保持不变。
+              {focusNames.length >= 3 && <strong>已选满 3 个重点频道。</strong>}
             </p>
 
             {focus && (

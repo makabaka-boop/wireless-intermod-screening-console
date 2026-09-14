@@ -808,4 +808,142 @@ describe("聚焦排查", () => {
     expect(screen.queryByText(/重点频道：/)).not.toBeInTheDocument();
     expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
   });
+
+  it("重点频道勾选上限为三个：选满后其余频道禁止勾选", async () => {
+    vi.stubGlobal("fetch", mockFetch(200, CONFLICT_RESPONSE));
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    const checkbox = (name: string) =>
+      screen.getByRole("checkbox", { name }) as HTMLInputElement;
+
+    checkFocusChannel("A（500.000 MHz）");
+    checkFocusChannel("B（500.100 MHz）");
+    checkFocusChannel("C（499.850 MHz）");
+
+    // 已勾选的三个保持可用，第四个被禁用，无法把选择扩大到四个
+    expect(checkbox("A（500.000 MHz）").disabled).toBe(false);
+    expect(checkbox("B（500.100 MHz）").disabled).toBe(false);
+    expect(checkbox("C（499.850 MHz）").disabled).toBe(false);
+    expect(checkbox("D（500.250 MHz）").disabled).toBe(true);
+    expect(screen.getByText("已选满 3 个重点频道。")).toBeInTheDocument();
+
+    // 取消一项后第四个恢复可选（纠正后限制放开）
+    checkFocusChannel("C（499.850 MHz）");
+    expect(checkbox("D（500.250 MHz）").disabled).toBe(false);
+  });
+
+  it("聚焦结果已显示时改选重点频道，立即隐藏旧结果，不拿旧条目冒充当前选择", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => FOCUS_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    checkFocusChannel("A（500.000 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+    await screen.findByRole("heading", {
+      name: "重点频道：A — 直接影响 1 项，来源相关 3 项",
+    });
+
+    // 改选：在 A 之外再勾选 B，旧的聚焦条目必须立刻消失
+    checkFocusChannel("B（500.100 MHz）");
+    expect(screen.queryByText(/重点频道：/)).not.toBeInTheDocument();
+    expect(container.querySelectorAll(".focus-result tbody tr")).toHaveLength(0);
+    // 完整冲突分组仍保留，等待用户就新选择重新发起聚焦
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+    // 未重新点击聚焦前不发起新请求
+    expect(fetchMock.mock.calls).toHaveLength(2);
+  });
+
+  it("聚焦被超限拒绝后取消一项使选择恢复合法，聚焦区原错误随之清除", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      // 服务端仍以行号 -2 拒绝超限选择（后端是最终校验方，例如并发旧页面提交了 4 个）
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [{ line: -2, message: "重点频道最多选择 3 个，请取消后重新选择" }],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    checkFocusChannel("A（500.000 MHz）");
+    checkFocusChannel("B（500.100 MHz）");
+    checkFocusChannel("C（499.850 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+
+    expect(await screen.findByText(/聚焦频道选择有误（1 项）/)).toBeInTheDocument();
+    expect(screen.getByText(/重点频道最多选择 3 个/)).toBeInTheDocument();
+
+    // 取消一项使选择恢复合法：原超限错误应立即随纠正清除，无需重新发起请求
+    checkFocusChannel("C（499.850 MHz）");
+    expect(screen.queryByText(/聚焦频道选择有误/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/重点频道最多选择 3 个/)).not.toBeInTheDocument();
+    // 上一次有效分析仍然保留
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(fetchMock.mock.calls).toHaveLength(2);
+  });
+
+  it("完成聚焦后直接编辑清单名称或频率，基于旧清单的聚焦结果立即隐藏", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => FOCUS_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    checkFocusChannel("A（500.000 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+    await screen.findByRole("heading", {
+      name: "重点频道：A — 直接影响 1 项，来源相关 3 项",
+    });
+
+    // 不重新提交，直接修改清单中 A 的频率：旧聚焦条目随之失效
+    fireEvent.change(screen.getByLabelText(/频道清单/), {
+      target: { value: "A 510.000\nB 500.100\nC 499.850\nD 500.250" },
+    });
+
+    expect(screen.queryByText(/重点频道：/)).not.toBeInTheDocument();
+    expect(container.querySelectorAll(".focus-result tbody tr")).toHaveLength(0);
+    // 修改尚未提交，不发起新请求；主分析结果（上一次有效结果）仍保留供重新排查
+    expect(fetchMock.mock.calls).toHaveLength(2);
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+  });
 });
