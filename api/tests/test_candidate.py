@@ -92,6 +92,18 @@ def test_candidate_name_with_separator_rejected():
         assert errs and errs[0].line == CANDIDATE_LINE and "空白或逗号" in errs[0].message
 
 
+def test_candidate_hash_prefix_name_rejected():
+    # 清单中 # 开头的整行会被当作注释：候选名称口径须与清单可接纳名称一致
+    for bad in ["#X", "#"]:
+        errs = candidate_errs(make(SAFE), bad, "500.000")
+        assert errs and errs[0].line == CANDIDATE_LINE and "#" in errs[0].message
+
+
+def test_candidate_name_with_inner_hash_accepted():
+    # 行首才是注释：名称中间含 # 在清单中同样合法，候选不应误拒
+    assert candidate_ok(make(SAFE), "X#1", "520.000").name == "X#1"
+
+
 def test_candidate_merge_over_32_rejected():
     channels = make("\n".join(f"CH{i} {500 + i * 5}.000" for i in range(32)))
     errs = candidate_errs(channels, "X", "690.000")
@@ -151,6 +163,18 @@ def test_risky_candidate_hits_itself_and_existing_channels():
     # 新增冲突沿用 目标频率 → 产物频率 → 目标名称 排序
     keys = [(c.target_freq_khz, c.product_khz, c.target_name) for c in ev.new_conflicts]
     assert keys == sorted(keys)
+
+
+def test_source_only_candidate_listed_as_affected():
+    # 候选仅作为来源生成命中既有频道的产物（自身从不被命中）时，
+    # 受影响频道名单仍应同时包含候选与目标频道
+    channels = make("A 500.000\nB 500.100")
+    ev = evaluate_candidate(channels, candidate_ok(channels, "X", "500.050"))
+    assert ev.status == "risky"
+    assert len(ev.new_conflicts) == 2
+    assert all(not c.target_is_candidate for c in ev.new_conflicts)
+    assert {c.target_name for c in ev.new_conflicts} == {"A", "B"}
+    assert ev.affected_channel_names == ["A", "B", "X"]
 
 
 def test_new_conflict_distinguishes_existing_and_new_source_pairs():

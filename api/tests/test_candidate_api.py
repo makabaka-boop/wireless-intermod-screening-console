@@ -153,6 +153,44 @@ def test_candidate_missing_fields_point_to_candidate_area():
     assert "候选频率缺失" in errors[0]["message"]
 
 
+def test_non_object_candidate_points_to_candidate_area():
+    # 非对象形式的候选值必须明确标记候选输入区（line=0），
+    # 不得误报为清单第 1 行的技术性错误
+    for bad in ["X 500.000", 123, ["X", "500.000"], True]:
+        resp = client.post("/api/analyze", json={"input": SAFE_INPUT, "candidate": bad})
+        assert resp.status_code == 422, f"candidate={bad!r} 应返回 422"
+        errors = resp.json()["errors"]
+        assert [e["line"] for e in errors] == [0]
+        assert "候选" in errors[0]["message"]
+
+
+def test_hash_prefix_candidate_name_rejected_at_candidate_area():
+    # 井号开头名称写入正式清单会被当作注释，候选校验须与清单口径一致
+    resp = client.post(
+        "/api/analyze",
+        json={"input": SAFE_INPUT, "candidate": {"name": "#X", "freq": "520.000"}},
+    )
+    assert resp.status_code == 422
+    errors = resp.json()["errors"]
+    assert [e["line"] for e in errors] == [0]
+    assert "#" in errors[0]["message"]
+
+
+def test_source_only_candidate_affected_includes_candidate():
+    # 候选仅作为产物来源命中既有频道（自身不被命中）时，
+    # 受影响名单仍应同时包含候选与目标频道
+    resp = client.post(
+        "/api/analyze",
+        json={"input": "A 500.000\nB 500.100", "candidate": {"name": "X", "freq": "500.050"}},
+    )
+    assert resp.status_code == 200
+    cand = resp.json()["candidate"]
+    assert cand["status"] == "risky"
+    assert cand["new_conflict_count"] == 2
+    assert all(not c["target_is_candidate"] for c in cand["new_conflicts"])
+    assert cand["affected_channel_names"] == ["A", "B", "X"]
+
+
 def test_invalid_list_still_rejected_with_original_line_numbers():
     # 即便候选本身合法，清单非法仍按原行号整批拒绝，不混入候选错误
     resp = client.post(

@@ -9,7 +9,9 @@
 6. 相同产物+目标只展示一次且列全来源，结果按目标频率→产物频率→目标名称排序；
 7. Web 页面可访问且通过 /api 反代到真实接口；
 8. 彩排候选试加：安全候选无增量、风险候选为自身及既有频道引入冲突、
-   重复/越界候选被拒绝且错误指向候选输入区、旧请求（不带候选）语义不变。
+   重复/越界候选被拒绝且错误指向候选输入区、旧请求（不带候选）语义不变；
+   候选仅作产物来源时受影响名单仍含候选自身、非对象候选值与井号开头
+   名称均按候选输入区（行号 0）拒绝。
 """
 
 from __future__ import annotations
@@ -276,6 +278,46 @@ def main() -> int:
         errors = resp.json()["errors"]
         expect(errors[0]["line"] == 0 and "上限 32" in errors[0]["message"], f"提示不符: {errors}")
 
+    def t_candidate_source_only_affected_includes_candidate():
+        # 候选仅作为产物来源命中既有频道（自身不被命中）时，
+        # 受影响频道名单也必须包含候选自身
+        resp = analyze("A 500.000\nB 500.100", {"name": "X", "freq": "500.050"})
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        cand = resp.json()["candidate"]
+        expect(cand["status"] == "risky", "候选引入增量冲突应判 risky")
+        expect(
+            all(not c["target_is_candidate"] for c in cand["new_conflicts"]),
+            "本场景候选自身不应被产物命中",
+        )
+        expect(
+            cand["affected_channel_names"] == ["A", "B", "X"],
+            f"受影响名单应同时包含候选与目标频道: {cand['affected_channel_names']}",
+        )
+
+    def t_non_object_candidate_points_to_candidate_area():
+        # 非对象形式的候选值必须标记候选输入区（line=0），不得误报清单第 1 行
+        resp = httpx.post(
+            f"{API}/api/analyze",
+            json={"input": "C1 500.000\nC2 510.000", "candidate": "X 500.000"},
+            timeout=10,
+        )
+        expect(resp.status_code == 422, f"非对象候选应 422，实际 {resp.status_code}")
+        errors = resp.json()["errors"]
+        expect(
+            errors and all(e["line"] == 0 for e in errors),
+            f"非对象候选应指向候选输入区(line=0): {errors}",
+        )
+
+    def t_hash_prefix_candidate_name_rejected():
+        # 井号开头名称写入正式清单会被当作注释，候选校验须与清单口径一致
+        resp = analyze("C1 500.000\nC2 510.000", {"name": "#X", "freq": "520.000"})
+        expect(resp.status_code == 422, f"井号开头候选名应 422，实际 {resp.status_code}")
+        errors = resp.json()["errors"]
+        expect(
+            errors and all(e["line"] == 0 for e in errors),
+            f"井号开头候选名应指向候选输入区(line=0): {errors}",
+        )
+
     def t_invalid_list_rejected_even_with_candidate():
         # 清单非法时仍按原行号整批拒绝，不评估候选、不给部分结果
         resp = analyze("CH1 500.0005\nCH2 469.000", {"name": "X", "freq": "520.000"})
@@ -352,6 +394,9 @@ def main() -> int:
         ("候选试加：风险候选命中自身与既有频道", t_candidate_risky_hits_itself_and_existing),
         ("候选试加：重复名称/频率与格式越界被拒（指向候选区）", t_candidate_duplicate_and_malformed_rejected),
         ("候选试加：合并后超过 32 频道直接提示", t_candidate_merge_over_32_rejected),
+        ("候选试加：候选仅作来源时受影响名单仍含候选自身", t_candidate_source_only_affected_includes_candidate),
+        ("候选试加：非对象候选值指向候选输入区", t_non_object_candidate_points_to_candidate_area),
+        ("候选试加：井号开头名称与清单口径一致被拒", t_hash_prefix_candidate_name_rejected),
         ("候选试加：清单非法仍按原行号整批拒绝", t_invalid_list_rejected_even_with_candidate),
         ("不带候选的旧请求维持原字段语义", t_legacy_request_without_candidate_unchanged),
         ("Web 页面可访问", t_web_page_served),

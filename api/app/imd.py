@@ -272,6 +272,8 @@ def parse_candidate(
 
     候选不参与清单解析，错误固定指向候选输入区（:data:`CANDIDATE_LINE`）。
     ``channels`` 为已成功解析的基线频道，用于名称/频率重复与合并数量校验。
+    名称口径与清单可接纳的名称一致：不得含空白/逗号分隔符，也不得以 ``#``
+    开头（清单中 ``#`` 开头的整行会被当作注释，候选写入后将丢失）。
     """
     errors: list[InputError] = []
 
@@ -285,6 +287,16 @@ def parse_candidate(
                 InputError(
                     CANDIDATE_LINE,
                     "候选名称「%s」非法：名称不得包含空白或逗号" % name,
+                )
+            )
+        elif name.startswith("#"):
+            # 清单中 # 开头的整行会被当作注释，此类名称写入正式清单后会丢失，
+            # 候选校验须与清单可接纳名称口径一致
+            errors.append(
+                InputError(
+                    CANDIDATE_LINE,
+                    f"候选名称「{name}」非法：名称不得以 # 开头，"
+                    "否则写入正式清单后整行会被当作注释",
                 )
             )
         elif any(c.name == name for c in channels):
@@ -375,6 +387,9 @@ def evaluate_candidate(channels: list[Channel], candidate: Channel) -> Candidate
             )
         )
         affected.add(c.target_name)
+        # 每条增量冲突都涉及候选（作为被命中目标或新增来源组合的一方），
+        # 即便候选自身从未被产物命中，也必须列入受影响频道名单
+        affected.add(candidate.name)
 
     new_conflicts.sort(
         key=lambda item: (item.target_freq_khz, item.product_khz, item.target_name)

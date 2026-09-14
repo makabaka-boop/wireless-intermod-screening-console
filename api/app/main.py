@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .imd import (
+    CANDIDATE_LINE,
     analyze,
     build_summary,
     evaluate_candidate,
@@ -42,7 +43,9 @@ class CandidateIn(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     input: str = Field(..., description="频道清单文本，每行：名称 频率(MHz)")
-    candidate: CandidateIn | None = Field(
+    # 候选结构在业务层校验：非对象形式（字符串/数字/数组等）必须按候选输入区
+    # 错误（行号 0）拒绝，不能落入请求体验证异常而误报为清单第 1 行
+    candidate: object = Field(
         default=None, description="可选：试加候选频道 {name, freq}，不写入正式清单"
     )
 
@@ -153,8 +156,24 @@ def analyze_endpoint(req: AnalyzeRequest):
 
     candidate_out = None
     if req.candidate is not None:
+        if not isinstance(req.candidate, dict):
+            # 非对象形式的候选值：明确标记候选输入区（行号 0），
+            # 不得误报为清单第 1 行的技术性错误
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "errors": [
+                        {
+                            "line": CANDIDATE_LINE,
+                            "message": "候选输入区格式错误：候选应为 {name, freq} 对象，"
+                            '例如 {"name": "X", "freq": "499.950"}',
+                        }
+                    ]
+                },
+            )
+        candidate_in = CandidateIn.model_validate(req.candidate)
         candidate, candidate_errors = parse_candidate(
-            req.candidate.name, req.candidate.freq, channels
+            candidate_in.name, candidate_in.freq, channels
         )
         if candidate_errors:
             # 候选区错误固定 line=0，前端可据此只在候选输入区提示，
