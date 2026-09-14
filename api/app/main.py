@@ -6,7 +6,9 @@
   请求体可选携带 ``candidate``（{"name", "freq"}）进行彩排试加评估，
   响应在保留基线字段语义的同时增加 ``candidate`` 评估对象；
   亦可携带 ``retune``（已登记频道名称）获取该频道 ±500 kHz 内的
-  微调频点建议，响应增加 ``retune`` 评估对象。
+  微调频点建议，响应增加 ``retune`` 评估对象；
+  亦可携带 ``focus``（一至三个重点频道名称列表）对现有冲突结果做
+  聚焦排查，响应增加 ``focus`` 评估对象，完整结果与摘要不因此改写。
 """
 
 from __future__ import annotations
@@ -22,13 +24,15 @@ from .imd import (
     analyze,
     build_summary,
     evaluate_candidate,
+    evaluate_focus,
     evaluate_retune,
     parse_candidate,
     parse_channels,
+    parse_focus_channels,
     parse_retune_target,
 )
 
-app = FastAPI(title="无线话筒互调排查台 API", version="1.2.0")
+app = FastAPI(title="无线话筒互调排查台 API", version="1.3.0")
 
 # 开发联调允许跨域；生产部署由 web 容器的 nginx 反向代理 /api，同源访问
 app.add_middleware(
@@ -57,6 +61,12 @@ class AnalyzeRequest(BaseModel):
     retune: object = Field(
         default=None,
         description="可选：微调目标频道名称，返回原频率 ±500 kHz 内的替换频点建议",
+    )
+    # 重点频道名称列表同样在业务层校验：非列表、名称不存在、重复或超过三个
+    # 必须按聚焦区错误（行号 -2）拒绝，不能误报为清单第 1 行的技术性错误
+    focus: object = Field(
+        default=None,
+        description="可选：一至三个重点频道名称列表，对现有冲突结果做聚焦排查",
     )
 
 
@@ -128,6 +138,23 @@ class RetuneOut(BaseModel):
     suggestions: list[RetuneSuggestionOut]
 
 
+class FocusEntryOut(BaseModel):
+    relation: str  # direct：目标即重点频道；source：仅来源组合含重点频道
+    target_name: str
+    target_freq_khz: int
+    product_khz: int
+    diff_khz: int
+    sources: list[list[str]]  # 该「目标+产物」的全部来源组合，不拆分
+
+
+class FocusOut(BaseModel):
+    names: list[str]  # 本次聚焦的重点频道（按请求顺序）
+    direct_count: int  # 直接影响条目数
+    source_count: int  # 来源相关条目数
+    # 直接影响整体在前，两类内部保持完整结果的原有顺序；为空即无相关冲突
+    entries: list[FocusEntryOut]
+
+
 class AnalyzeResponse(BaseModel):
     channel_count: int
     channels: list[ChannelOut]
@@ -138,6 +165,8 @@ class AnalyzeResponse(BaseModel):
     candidate: CandidateOut | None = None
     # 仅当请求携带微调参数时出现；未传微调参数时维持原有字段语义
     retune: RetuneOut | None = None
+    # 仅当请求携带聚焦参数时出现；未传聚焦参数时维持原有字段语义
+    focus: FocusOut | None = None
 
 
 class ErrorItem(BaseModel):
@@ -167,7 +196,7 @@ def _conflict_out(c) -> ConflictOut:
 @app.post(
     "/api/analyze",
     response_model=AnalyzeResponse,
-    # 未传候选/微调参数时响应中不出现对应字段，严格维持旧版字段语义
+    # 未传候选/微调/聚焦参数时响应中不出现对应字段，严格维持旧版字段语义
     response_model_exclude_none=True,
     responses={422: {"model": ErrorResponse, "description": "输入校验失败"}},
 )
@@ -276,6 +305,41 @@ def analyze_endpoint(req: AnalyzeRequest):
         if conflicts is None:
             conflicts = retune_eval.baseline_conflicts
 
+    focus_out = None
+    if req.focus is not None:
+        focus_names, focus_errors = parse_focus_channels(req.focus, channels)
+        if focus_errors:
+            # 聚焦区错误固定 line=-2，前端可据此只在聚焦区提示，
+            # 且不清空上一次有效分析结果
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "errors": [
+                        {"line": e.line, "message": e.message} for e in focus_errors
+                    ]
+                },
+            )
+        if conflicts is None:
+            conflicts = analyze(channels)
+        # 复用顶层完整冲突结果做聚焦分级，完整结果与摘要不因聚焦而改写
+        focus_eval = evaluate_focus(conflicts, focus_names)
+        focus_out = FocusOut(
+            names=focus_eval.names,
+            direct_count=focus_eval.direct_count,
+            source_count=focus_eval.source_count,
+            entries=[
+                FocusEntryOut(
+                    relation=e.relation,
+                    target_name=e.target_name,
+                    target_freq_khz=e.target_freq_khz,
+                    product_khz=e.product_khz,
+                    diff_khz=e.diff_khz,
+                    sources=[[x, y] for x, y in e.sources],
+                )
+                for e in focus_eval.entries
+            ],
+        )
+
     if conflicts is None:
         conflicts = analyze(channels)
 
@@ -287,4 +351,5 @@ def analyze_endpoint(req: AnalyzeRequest):
         summary=build_summary(channels, conflicts),
         candidate=candidate_out,
         retune=retune_out,
+        focus=focus_out,
     )

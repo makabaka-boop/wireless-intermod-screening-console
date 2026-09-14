@@ -6,6 +6,7 @@ import type {
   CandidateOut,
   ConflictOut,
   ErrorItem,
+  FocusOut,
   NewConflictOut,
   RetuneOut,
 } from "./types";
@@ -20,6 +21,8 @@ D 500.250`;
 const CANDIDATE_AREA_LINE = 0;
 /** 微调区错误固定使用行号 -1 */
 const RETUNE_AREA_LINE = -1;
+/** 聚焦区错误固定使用行号 -2 */
+const FOCUS_AREA_LINE = -2;
 
 interface ConflictGroup {
   targetName: string;
@@ -80,10 +83,12 @@ export default function App() {
   const [candidateName, setCandidateName] = useState("");
   const [candidateFreq, setCandidateFreq] = useState("");
   const [retuneTarget, setRetuneTarget] = useState("");
+  const [focusNames, setFocusNames] = useState<string[]>([]);
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [errors, setErrors] = useState<ErrorItem[]>([]);
   const [candidateErrors, setCandidateErrors] = useState<ErrorItem[]>([]);
   const [retuneErrors, setRetuneErrors] = useState<ErrorItem[]>([]);
+  const [focusErrors, setFocusErrors] = useState<ErrorItem[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -97,7 +102,7 @@ export default function App() {
     [result],
   );
 
-  async function runAnalyze(mode: "list" | "candidate" | "retune") {
+  async function runAnalyze(mode: "list" | "candidate" | "retune" | "focus") {
     setLoading(true);
     setFatal(null);
     setCopied(false);
@@ -106,31 +111,45 @@ export default function App() {
         text,
         mode === "candidate" ? { name: candidateName, freq: candidateFreq } : undefined,
         mode === "retune" ? retuneTarget : undefined,
+        mode === "focus" ? focusNames : undefined,
       );
       setResult(data);
       setErrors([]);
       setCandidateErrors([]);
       setRetuneErrors([]);
+      setFocusErrors([]);
+      // 重点频道勾选项随最新有效结果收敛，避免残留已不在清单中的不可见勾选
+      const validNames = new Set(data.channels.map((c) => c.name));
+      setFocusNames((prev) => prev.filter((n) => validNames.has(n)));
     } catch (err) {
       if (err instanceof InputError) {
-        // 行号 0 专指候选输入区、-1 专指微调区：区域错误只在对应区域提示，
-        // 且不覆盖上一次有效结果；清单行号（≥1）错误整批拒绝
+        // 行号 0 专指候选输入区、-1 专指微调区、-2 专指聚焦区：区域错误只在
+        // 对应区域提示，且不覆盖上一次有效结果；清单行号（≥1）错误整批拒绝
         const listErrors = err.errors.filter((e) => e.line >= 1);
         const areaErrors = err.errors.filter((e) => e.line === CANDIDATE_AREA_LINE);
         const tuneErrors = err.errors.filter((e) => e.line === RETUNE_AREA_LINE);
+        const areaFocusErrors = err.errors.filter((e) => e.line === FOCUS_AREA_LINE);
         if (listErrors.length > 0) {
           setErrors(listErrors);
           setCandidateErrors([]);
           setRetuneErrors([]);
+          setFocusErrors([]);
           setResult(null); // 清单非法：整批拒绝，不展示任何风险结果
         } else if (tuneErrors.length > 0) {
           setRetuneErrors(tuneErrors);
           setErrors([]);
           setCandidateErrors([]);
+          setFocusErrors([]);
+        } else if (areaFocusErrors.length > 0) {
+          setFocusErrors(areaFocusErrors);
+          setErrors([]);
+          setCandidateErrors([]);
+          setRetuneErrors([]);
         } else {
           setCandidateErrors(areaErrors);
           setErrors([]);
           setRetuneErrors([]);
+          setFocusErrors([]);
         }
       } else {
         setFatal(err instanceof Error ? err.message : "未知错误");
@@ -153,6 +172,16 @@ export default function App() {
     void runAnalyze("retune");
   }
 
+  function toggleFocus(name: string) {
+    setFocusNames((prev) =>
+      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name],
+    );
+  }
+
+  function onFocus() {
+    void runAnalyze("focus");
+  }
+
   async function copySummary() {
     if (!result) return;
     try {
@@ -173,6 +202,7 @@ export default function App() {
 
   const candidate: CandidateOut | undefined = result?.candidate;
   const retune: RetuneOut | undefined = result?.retune;
+  const focus: FocusOut | undefined = result?.focus;
 
   return (
     <main className="page">
@@ -289,6 +319,23 @@ export default function App() {
         </section>
       )}
 
+      {focusErrors.length > 0 && (
+        <section className="panel error-panel focus-error-panel" role="alert">
+          <h2>
+            聚焦频道选择有误（{focusErrors.length} 项）
+            {result ? "，已保留当前分析结果" : "，请重新勾选"}
+          </h2>
+          <ul className="error-list">
+            {focusErrors.map((e, i) => (
+              <li key={i}>
+                <span className="line-badge">聚焦区</span>
+                {e.message}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {result && (
         <section className="panel">
           {result.conflict_count === 0 ? (
@@ -344,6 +391,87 @@ export default function App() {
               )}
             </div>
           )}
+
+          <div className="focus-box">
+            <div className="focus-controls">
+              <h3>聚焦排查</h3>
+              {result.channels.map((c) => (
+                <label className="focus-option" key={c.name}>
+                  <input
+                    type="checkbox"
+                    checked={focusNames.includes(c.name)}
+                    onChange={() => toggleFocus(c.name)}
+                  />
+                  {c.name}（{formatMhz(c.freq_khz)} MHz）
+                </label>
+              ))}
+              <button
+                type="button"
+                className="secondary"
+                disabled={loading || focusNames.length === 0}
+                onClick={onFocus}
+              >
+                {loading ? "聚焦中…" : "聚焦排查"}
+              </button>
+            </div>
+            <p className="hint">
+              勾选一至三个重点频道（如主持人、主唱话筒），在顶部优先展示与之相关的冲突条目；
+              完整冲突分组与可复制摘要保持不变。
+            </p>
+
+            {focus && (
+              <div className="focus-result" role="status">
+                <h4>
+                  重点频道：{focus.names.join("、")} — 直接影响 {focus.direct_count}{" "}
+                  项，来源相关 {focus.source_count} 项
+                </h4>
+                {focus.entries.length === 0 ? (
+                  <p className="focus-empty">
+                    重点频道与当前 {result.conflict_count} 项冲突均无关联，无需优先处理。
+                  </p>
+                ) : (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>关系</th>
+                        <th>受影响频道</th>
+                        <th>互调产物</th>
+                        <th>差值</th>
+                        <th>来源组合</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {focus.entries.map((e) => (
+                        <tr key={`${e.target_name}-${e.product_khz}`}>
+                          <td>
+                            <span
+                              className={
+                                e.relation === "direct" ? "tag tag-direct" : "tag tag-source"
+                              }
+                            >
+                              {e.relation === "direct" ? "直接影响" : "来源相关"}
+                            </span>
+                          </td>
+                          <td>
+                            {e.target_name}（{formatMhz(e.target_freq_khz)} MHz）
+                          </td>
+                          <td>{formatMhz(e.product_khz)} MHz</td>
+                          <td>{e.diff_khz} kHz</td>
+                          <td>
+                            {e.sources.map((pair, i) => (
+                              <span className="source" key={i}>
+                                {pair[0]} + {pair[1]}
+                              </span>
+                            ))}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
+          </div>
 
           {groups.map((g) => (
             <article className="group" key={g.targetName}>

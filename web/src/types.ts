@@ -61,6 +61,30 @@ export interface RetuneOut {
   suggestions: RetuneSuggestionOut[];
 }
 
+/** 聚焦排查：一条与重点频道相关的冲突条目（保留原目标、产物与全部来源） */
+export interface FocusEntryOut {
+  /** direct：目标即重点频道；source：仅来源组合含重点频道 */
+  relation: "direct" | "source";
+  target_name: string;
+  target_freq_khz: number;
+  product_khz: number;
+  diff_khz: number;
+  /** 该「目标 + 产物」的全部来源组合，不拆分 */
+  sources: [string, string][];
+}
+
+/** 聚焦排查评估（仅携带 focus 的请求返回） */
+export interface FocusOut {
+  /** 本次聚焦的重点频道（按请求顺序） */
+  names: string[];
+  /** 直接影响条目数 */
+  direct_count: number;
+  /** 来源相关条目数 */
+  source_count: number;
+  /** 直接影响整体在前，两类内部保持完整结果的原有顺序；为空即无相关冲突 */
+  entries: FocusEntryOut[];
+}
+
 export interface AnalyzeResponse {
   channel_count: number;
   channels: ChannelOut[];
@@ -69,6 +93,7 @@ export interface AnalyzeResponse {
   summary: string;
   candidate?: CandidateOut;
   retune?: RetuneOut;
+  focus?: FocusOut;
 }
 
 export interface ErrorItem {

@@ -16,6 +16,11 @@
    字段可复算、±500 kHz 与带缘边界候选参与计算、无改善返回空建议、
    未知微调频道指向微调区（行号 -1）且不影响既有结果、
    未携带微调参数的旧请求语义不变。
+10. 聚焦排查：直接影响（目标即重点频道）整体排在来源相关（仅来源组合
+    含重点频道）之前且两类内部保持原有顺序、含多组来源的条目不拆分不
+    重复、无相关冲突返回明确空结果、完整冲突分组与摘要不因聚焦改写、
+    名称不存在/重复/超过三个/非列表值指向聚焦区（行号 -2）、
+    未携带聚焦参数的旧请求语义不变。
 """
 
 from __future__ import annotations
@@ -59,12 +64,19 @@ def wait_ready() -> None:
     raise RuntimeError(f"等待 {API} 就绪超时（{TIMEOUT}s）")
 
 
-def analyze(text: str, candidate: dict | None = None, retune: str | None = None) -> httpx.Response:
+def analyze(
+    text: str,
+    candidate: dict | None = None,
+    retune: str | None = None,
+    focus: list | None = None,
+) -> httpx.Response:
     payload = {"input": text}
     if candidate is not None:
         payload["candidate"] = candidate
     if retune is not None:
         payload["retune"] = retune
+    if focus is not None:
+        payload["focus"] = focus
     return httpx.post(f"{API}/api/analyze", json=payload, timeout=10)
 
 
@@ -499,6 +511,150 @@ def main() -> int:
             f"旧字段集合被改变: {set(data.keys())}",
         )
 
+    def t_focus_direct_before_source_and_results_unchanged():
+        # 重点频道 A：目标为 A 的条目（直接影响）整体排在仅来源含 A 的条目
+        # （来源相关）之前；完整冲突分组与摘要不因聚焦而改写
+        text = "A 500.000\nB 500.100\nC 499.850\nD 500.250"
+        resp = analyze(text, focus=["A"])
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        data = resp.json()
+        plain = analyze(text).json()
+        expect(data["conflict_count"] == 4, "顶层冲突应保持完整 4 项")
+        expect(data["conflicts"] == plain["conflicts"], "完整冲突分组不得因聚焦改写")
+        expect(data["summary"] == plain["summary"], "可复制摘要不得因聚焦改写")
+        focus = data.get("focus")
+        expect(bool(focus), "携带聚焦参数时响应必须包含 focus 评估对象")
+        expect(focus["names"] == ["A"], f"重点频道不符: {focus['names']}")
+        expect(
+            focus["direct_count"] == 1 and focus["source_count"] == 3,
+            f"分级计数不符: {focus}",
+        )
+        got = [
+            (e["relation"], e["target_name"], e["product_khz"]) for e in focus["entries"]
+        ]
+        expect(
+            got
+            == [
+                ("direct", "A", 499_950),  # 目标即重点频道，整体在前
+                ("source", "C", 499_900),  # 仅来源含 A，保持原有冲突顺序
+                ("source", "B", 500_150),
+                ("source", "D", 500_200),
+            ],
+            f"聚焦排序不符: {got}",
+        )
+        # 每个聚焦条目保留原目标、产物与全部来源
+        entry = focus["entries"][0]
+        expect(
+            entry["target_freq_khz"] == 500_000
+            and entry["diff_khz"] == 50
+            and entry["sources"] == [["B", "D"]],
+            f"聚焦条目字段不符: {entry}",
+        )
+
+    def t_focus_multi_source_entry_not_split_or_duplicated():
+        text = "T 500.000\nA 500.100\nB 500.150\nC 500.200\nD 500.350"
+        resp = analyze(text, focus=["T"])
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        focus = resp.json()["focus"]
+        expect(
+            focus["direct_count"] == 3 and focus["source_count"] == 4,
+            f"分级计数不符: {focus}",
+        )
+        got = [
+            (e["relation"], e["target_name"], e["product_khz"]) for e in focus["entries"]
+        ]
+        expect(
+            got
+            == [
+                ("direct", "T", 499_950),
+                ("direct", "T", 500_000),
+                ("direct", "T", 500_050),
+                ("source", "B", 500_200),
+                ("source", "C", 500_200),
+                ("source", "D", 500_300),
+                ("source", "D", 500_400),
+            ],
+            f"聚焦排序不符: {got}",
+        )
+        # C 500200 含两组来源 [A,B] 与 [A,T]：只出现一次且列全来源
+        hits = [
+            e
+            for e in focus["entries"]
+            if (e["target_name"], e["product_khz"]) == ("C", 500_200)
+        ]
+        expect(len(hits) == 1, f"含多组来源的条目不得拆分或重复: {hits}")
+        expect(
+            hits[0]["sources"] == [["A", "B"], ["A", "T"]],
+            f"来源组合应列全: {hits[0]['sources']}",
+        )
+
+    def t_focus_no_related_conflicts_returns_empty():
+        # E 与任何冲突无关：聚焦返回明确空结果，完整结果保持原样
+        resp = analyze(
+            "A 500.000\nB 500.100\nC 499.850\nD 500.250\nE 600.000", focus=["E"]
+        )
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        data = resp.json()
+        expect(data["conflict_count"] == 4, "完整冲突结果应保持 4 项")
+        focus = data["focus"]
+        expect(focus["names"] == ["E"], f"重点频道不符: {focus['names']}")
+        expect(focus["entries"] == [], f"无相关冲突时聚焦条目应为空: {focus['entries']}")
+        expect(
+            focus["direct_count"] == 0 and focus["source_count"] == 0,
+            "无相关冲突时分级计数应为 0",
+        )
+
+    def t_focus_invalid_selections_point_to_focus_area():
+        text = "A 500.000\nB 500.100\nC 499.850\nD 500.250"
+        cases = [
+            (["ZZ"], "不在当前清单"),  # 名称不存在
+            (["A", "C", "A"], "重复"),  # 重复选择
+            (["A", "B", "C", "D"], "最多选择 3 个"),  # 超过三个
+            ([], "缺失"),  # 空列表
+        ]
+        for value, keyword in cases:
+            resp = analyze(text, focus=value)
+            expect(resp.status_code == 422, f"focus={value} 应 422，实际 {resp.status_code}")
+            data = resp.json()
+            expect("conflicts" not in data, "聚焦选择非法时不得给出风险结果")
+            errors = data["errors"]
+            expect(
+                errors and all(e["line"] == -2 for e in errors),
+                f"聚焦错误须指向聚焦区(line=-2): {errors}",
+            )
+            expect(keyword in errors[0]["message"], f"提示应包含「{keyword}」: {errors}")
+        # 非列表形式的聚焦值同样指向聚焦区，不得误报清单第 1 行
+        resp = httpx.post(
+            f"{API}/api/analyze",
+            json={"input": text, "focus": "A"},
+            timeout=10,
+        )
+        expect(resp.status_code == 422, f"非列表聚焦值应 422，实际 {resp.status_code}")
+        expect(
+            all(e["line"] == -2 for e in resp.json()["errors"]),
+            "非列表聚焦值应指向聚焦区(line=-2)",
+        )
+
+    def t_focus_invalid_list_rejected_with_original_line_numbers():
+        # 清单非法时仍按原行号整批拒绝，不评估聚焦、不给部分结果
+        resp = analyze("CH1 500.0005\nCH2 469.000", focus=["CH1"])
+        expect(resp.status_code == 422, f"应 422，实际 {resp.status_code}")
+        data = resp.json()
+        expect("conflicts" not in data, "不得给出部分风险结果")
+        expect([e["line"] for e in data["errors"]] == [1, 2], "清单非法须按原行号整批拒绝")
+
+    def t_legacy_request_without_focus_unchanged():
+        # 未携带聚焦参数的请求：响应字段与旧版逐字段一致（无 focus 键）
+        resp = analyze("A 500.000\nB 500.100\nC 499.850\nD 500.250")
+        expect(resp.status_code == 200, f"HTTP {resp.status_code}")
+        data = resp.json()
+        expect("focus" not in data, "旧请求响应中不应出现 focus 字段")
+        expect(
+            set(data.keys())
+            == {"channel_count", "channels", "conflict_count", "conflicts", "summary"},
+            f"旧字段集合被改变: {set(data.keys())}",
+        )
+
     def t_web_page_served():
         resp = httpx.get(f"{WEB}/", timeout=10, follow_redirects=True)
         expect(resp.status_code == 200, f"Web HTTP {resp.status_code}")
@@ -512,6 +668,10 @@ def main() -> int:
         expect("查找微调频点" in bundle, "JS bundle 应包含微调频点按钮")
         expect("范围内无改善" in bundle, "JS bundle 应包含微调无改善提示")
         expect("微调区" in bundle, "JS bundle 应包含微调错误定位提示")
+        expect("聚焦排查" in bundle, "JS bundle 应包含聚焦排查按钮")
+        expect("直接影响" in bundle, "JS bundle 应包含直接影响标签")
+        expect("来源相关" in bundle, "JS bundle 应包含来源相关标签")
+        expect("聚焦区" in bundle, "JS bundle 应包含聚焦错误定位提示")
 
     def t_web_proxy_to_api():
         # 通过 web 容器的 /api 反代提交，验证联调链路真实可用
@@ -558,6 +718,30 @@ def main() -> int:
             f"反代微调建议不符: {ret and ret['suggestions']}",
         )
 
+    def t_web_proxy_focus():
+        # 页面的聚焦排查同样经 /api 反代到真实接口
+        resp = httpx.post(
+            f"{WEB}/api/analyze",
+            json={
+                "input": "A 500.000\nB 500.100\nC 499.850\nD 500.250",
+                "focus": ["A"],
+            },
+            timeout=10,
+        )
+        expect(resp.status_code == 200, f"经反代聚焦失败: HTTP {resp.status_code}")
+        data = resp.json()
+        expect(data["conflict_count"] == 4, "顶层结果应保持完整 4 项")
+        focus = data.get("focus")
+        expect(bool(focus), "反代聚焦应返回 focus 评估对象")
+        expect(
+            focus["direct_count"] == 1 and focus["source_count"] == 3,
+            f"反代聚焦分级计数不符: {focus and focus['names']}",
+        )
+        expect(
+            [e["relation"] for e in focus["entries"]] == ["direct", "source", "source", "source"],
+            "直接影响应整体排在来源相关之前",
+        )
+
     checks = [
         ("API 健康检查", t_health),
         ("保护带边界：恰好 50 kHz 稳定命中", t_boundary_50khz_hit),
@@ -583,10 +767,17 @@ def main() -> int:
         ("微调频点：未知/非法微调频道指向微调区", t_retune_unknown_channel_points_to_retune_area),
         ("微调频点：清单非法仍按原行号整批拒绝", t_retune_invalid_list_rejected_with_original_line_numbers),
         ("不带微调参数的旧请求维持原字段语义", t_legacy_request_without_retune_unchanged),
+        ("聚焦排查：直接影响排在来源相关之前且完整结果不改写", t_focus_direct_before_source_and_results_unchanged),
+        ("聚焦排查：含多组来源的条目不拆分不重复", t_focus_multi_source_entry_not_split_or_duplicated),
+        ("聚焦排查：无相关冲突返回明确空结果", t_focus_no_related_conflicts_returns_empty),
+        ("聚焦排查：不存在/重复/超三个/非列表指向聚焦区", t_focus_invalid_selections_point_to_focus_area),
+        ("聚焦排查：清单非法仍按原行号整批拒绝", t_focus_invalid_list_rejected_with_original_line_numbers),
+        ("不带聚焦参数的旧请求维持原字段语义", t_legacy_request_without_focus_unchanged),
         ("Web 页面可访问", t_web_page_served),
         ("Web /api 反代联调链路", t_web_proxy_to_api),
         ("Web /api 反代候选试加链路", t_web_proxy_candidate_trial),
         ("Web /api 反代微调频点链路", t_web_proxy_retune),
+        ("Web /api 反代聚焦排查链路", t_web_proxy_focus),
     ]
     for name, fn in checks:
         check(name, fn)

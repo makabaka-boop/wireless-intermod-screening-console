@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { AnalyzeResponse, CandidateOut, RetuneOut } from "./types";
+import type { AnalyzeResponse, CandidateOut, FocusOut, RetuneOut } from "./types";
 
 const CONFLICT_RESPONSE: AnalyzeResponse = {
   channel_count: 4,
@@ -162,6 +162,66 @@ const RETUNE_EMPTY_RESPONSE: AnalyzeResponse = {
 
 function selectRetuneTarget(name: string) {
   fireEvent.change(screen.getByLabelText("微调频道"), { target: { value: name } });
+}
+
+const FOCUS_RESULT: FocusOut = {
+  names: ["A"],
+  direct_count: 1,
+  source_count: 3,
+  entries: [
+    {
+      relation: "direct",
+      target_name: "A",
+      target_freq_khz: 500_000,
+      product_khz: 499_950,
+      diff_khz: 50,
+      sources: [["B", "D"]],
+    },
+    {
+      relation: "source",
+      target_name: "C",
+      target_freq_khz: 499_850,
+      product_khz: 499_900,
+      diff_khz: 50,
+      sources: [["A", "B"]],
+    },
+    {
+      relation: "source",
+      target_name: "B",
+      target_freq_khz: 500_100,
+      product_khz: 500_150,
+      diff_khz: 50,
+      sources: [["A", "C"]],
+    },
+    {
+      relation: "source",
+      target_name: "D",
+      target_freq_khz: 500_250,
+      product_khz: 500_200,
+      diff_khz: 50,
+      sources: [["A", "B"]],
+    },
+  ],
+};
+
+const FOCUS_RESPONSE: AnalyzeResponse = {
+  ...CONFLICT_RESPONSE,
+  focus: FOCUS_RESULT,
+};
+
+const CONFLICT_WITH_E_RESPONSE: AnalyzeResponse = {
+  ...CONFLICT_RESPONSE,
+  channel_count: 5,
+  channels: [...CONFLICT_RESPONSE.channels, { name: "E", freq_khz: 600_000, line: 6 }],
+};
+
+const FOCUS_EMPTY_RESPONSE: AnalyzeResponse = {
+  ...CONFLICT_WITH_E_RESPONSE,
+  focus: { names: ["E"], direct_count: 0, source_count: 0, entries: [] },
+};
+
+function checkFocusChannel(name: string) {
+  fireEvent.click(screen.getByRole("checkbox", { name }));
 }
 
 beforeEach(() => {
@@ -568,5 +628,184 @@ describe("微调频点", () => {
     expect(screen.getByText("第 1 行")).toBeInTheDocument();
     expect(screen.queryByText(/受影响频道/)).not.toBeInTheDocument();
     expect(screen.queryByText(/微调频道选择有误/)).not.toBeInTheDocument();
+  });
+});
+
+describe("聚焦排查", () => {
+  it("勾选重点频道后点击聚焦排查，顶部展示分级条目且完整分组与摘要不变", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => FOCUS_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<App />);
+
+    const listInput = "A 500.000\nB 500.100\nC 499.850\nD 500.250";
+    submitForm(listInput);
+    await screen.findByText(/发现 4 项冲突/);
+
+    // 从成功返回的频道中勾选重点频道并聚焦
+    checkFocusChannel("A（500.000 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toBe("/api/analyze");
+    expect(JSON.parse(init.body)).toEqual({ input: listInput, focus: ["A"] });
+
+    // 聚焦结果：直接影响整体排在来源相关之前，标签区分两类关系
+    expect(
+      await screen.findByRole("heading", {
+        name: "重点频道：A — 直接影响 1 项，来源相关 3 项",
+      }),
+    ).toBeInTheDocument();
+    const rows = Array.from(container.querySelectorAll(".focus-result tbody tr"));
+    expect(rows).toHaveLength(4);
+    expect(rows[0].textContent).toContain("直接影响");
+    expect(rows[0].textContent).toContain("A（500.000 MHz）");
+    for (const row of rows.slice(1)) {
+      expect(row.textContent).toContain("来源相关");
+    }
+    expect(screen.getByText("直接影响")).toBeInTheDocument();
+    expect(screen.getAllByText("来源相关")).toHaveLength(3);
+    // 聚焦条目保留原目标、产物与全部来源
+    expect(rows[0].textContent).toContain("499.950 MHz");
+    expect(rows[0].textContent).toContain("B + D");
+
+    // 聚焦结果位于全部冲突分组之前，分组与摘要原样保留
+    const focusEl = container.querySelector(".focus-result");
+    const groupEl = container.querySelector(".group");
+    expect(focusEl).not.toBeNull();
+    expect(groupEl).not.toBeNull();
+    expect(
+      focusEl!.compareDocumentPosition(groupEl!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/冲突总数：4/)).toBeInTheDocument();
+  });
+
+  it("重点频道与冲突无关时显示明确空结果", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_WITH_E_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => FOCUS_EMPTY_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250\nE 600.000");
+    await screen.findByText(/发现 4 项冲突/);
+
+    checkFocusChannel("E（600.000 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+
+    expect(
+      await screen.findByText(/重点频道与当前 4 项冲突均无关联，无需优先处理/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "重点频道：E — 直接影响 0 项，来源相关 0 项" }),
+    ).toBeInTheDocument();
+    // 完整冲突分组仍然保留
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+  });
+
+  it("重点频道不存在时错误定位到聚焦区，且保留上一次有效分析", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          errors: [
+            { line: -2, message: "重点频道「A」不在当前清单中，请从分析结果关联的频道中勾选" },
+          ],
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    submitForm("A 500.000\nB 500.100\nC 499.850\nD 500.250");
+    await screen.findByText(/发现 4 项冲突/);
+
+    // 提交后改掉清单文本（移除 A），再基于上一次结果发起聚焦
+    fireEvent.change(screen.getByLabelText(/频道清单/), {
+      target: { value: "B 500.100\nC 499.850\nD 500.250" },
+    });
+    checkFocusChannel("A（500.000 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+
+    expect(
+      await screen.findByText(/聚焦频道选择有误（1 项），已保留当前分析结果/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("聚焦区")).toBeInTheDocument();
+    expect(screen.getByText(/重点频道「A」不在当前清单中/)).toBeInTheDocument();
+    // 既有分析结果（冲突分组）仍然保留
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
+    expect(screen.getByText(/受影响频道 C（499\.850 MHz）/)).toBeInTheDocument();
+    // 不混入清单、候选与微调错误面板
+    expect(screen.queryByText(/输入有误/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/候选输入有误/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/微调频道选择有误/)).not.toBeInTheDocument();
+  });
+
+  it("提交排查（无聚焦）不携带 focus 字段，且会清走上一次聚焦结果", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => FOCUS_RESPONSE,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => CONFLICT_RESPONSE,
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const listInput = "A 500.000\nB 500.100\nC 499.850\nD 500.250";
+    submitForm(listInput);
+    await screen.findByText(/发现 4 项冲突/);
+
+    checkFocusChannel("A（500.000 MHz）");
+    fireEvent.click(screen.getByRole("button", { name: /聚焦排查/ }));
+    await screen.findByRole("heading", {
+      name: "重点频道：A — 直接影响 1 项，来源相关 3 项",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /提交排查/ }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const [, init3] = fetchMock.mock.calls[2];
+    expect(JSON.parse(init3.body)).toEqual({ input: listInput });
+    // 旧请求语义不变：响应无 focus 时不再展示聚焦结果
+    expect(screen.queryByText(/重点频道：/)).not.toBeInTheDocument();
+    expect(screen.getByText(/发现 4 项冲突/)).toBeInTheDocument();
   });
 });

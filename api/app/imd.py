@@ -25,6 +25,14 @@
 按（冲突总数，移动距离，频率升序）稳定排名，最多返回
 :data:`RETUNE_MAX_SUGGESTIONS` 条建议；建议只作展示，不写回清单。
 微调区错误使用 :data:`RETUNE_LINE`（-1）作为行号。
+
+聚焦排查（围绕主持人/主唱等重点话筒优先处理冲突）：
+``evaluate_focus`` 复用现有冲突结果，不重新计算、不改写完整分组：
+目标频道即重点频道的条目标为「直接影响」，仅来源组合含重点频道的
+条目标为「来源相关」，按（关系等级，原有顺序）稳定排列——直接影响
+整体在前，两类内部各自保持完整结果的原有顺序；每个聚焦条目保留
+原目标、产物与全部来源组合，含多组来源的条目不拆分、不重复。
+聚焦区错误使用 :data:`FOCUS_LINE`（-2）作为行号。
 """
 
 from __future__ import annotations
@@ -47,6 +55,11 @@ RETUNE_STEP_KHZ = 25
 RETUNE_MAX_SUGGESTIONS = 5
 # 微调区错误的固定行号（-1 专指微调区，与清单行号、候选区行号区分）
 RETUNE_LINE = -1
+
+# 聚焦排查：一次最多勾选 3 个重点频道
+FOCUS_MAX_CHANNELS = 3
+# 聚焦区错误的固定行号（-2 专指聚焦区，与清单行号、候选区、微调区行号区分）
+FOCUS_LINE = -2
 
 # 名称中不允许出现的分隔字符：空白、英文逗号、中文逗号（与清单两列分隔口径一致）
 NAME_SEPARATOR_PATTERN = re.compile(r"[\s,，]")
@@ -518,3 +531,141 @@ def evaluate_retune(channels: list[Channel], target: Channel) -> RetuneEvaluatio
         baseline_conflicts=baseline,
         suggestions=suggestions[:RETUNE_MAX_SUGGESTIONS],
     )
+
+
+# 聚焦条目与重点频道的关系等级：直接影响（目标即重点频道）整体排在
+# 来源相关（仅来源组合含重点频道）之前
+FOCUS_RELATION_DIRECT = "direct"
+FOCUS_RELATION_SOURCE = "source"
+
+
+@dataclass
+class FocusEntry:
+    """一条与重点频道相关的冲突条目（完整保留原目标、产物与全部来源）。"""
+
+    relation: str  # FOCUS_RELATION_DIRECT / FOCUS_RELATION_SOURCE
+    target_name: str
+    target_freq_khz: int
+    product_khz: int
+    diff_khz: int
+    sources: list[tuple[str, str]]  # 该「目标 + 产物」的全部来源组合，不拆分
+
+
+@dataclass
+class FocusEvaluation:
+    """聚焦排查结果；``entries`` 为空表示重点频道与当前冲突均无关联。"""
+
+    names: list[str]  # 本次聚焦的重点频道（按请求顺序）
+    # 按（关系等级，原有顺序）稳定排列：直接影响在前，两类内部保持原有冲突顺序
+    entries: list[FocusEntry]
+
+    @property
+    def direct_count(self) -> int:
+        return sum(1 for e in self.entries if e.relation == FOCUS_RELATION_DIRECT)
+
+    @property
+    def source_count(self) -> int:
+        return sum(1 for e in self.entries if e.relation == FOCUS_RELATION_SOURCE)
+
+
+def parse_focus_channels(
+    value: object, channels: list[Channel]
+) -> tuple[list[str] | None, list[InputError]]:
+    """校验重点频道名称列表（一至三个、不得重复、必须已在清单中登记）。
+
+    聚焦区错误固定指向 :data:`FOCUS_LINE`，与清单正文行号、候选区、
+    微调区行号区分；名称不存在/重复/超限时调用方保留上一次有效分析结果。
+    """
+    if not isinstance(value, list):
+        return None, [
+            InputError(
+                FOCUS_LINE,
+                "聚焦频道格式错误：应为重点频道名称列表，"
+                '例如 ["主持人", "主唱"]',
+            )
+        ]
+
+    errors: list[InputError] = []
+    names: list[str] = []
+    if not value:
+        errors.append(
+            InputError(
+                FOCUS_LINE,
+                f"聚焦频道缺失：请从分析结果关联的频道中勾选一至 {FOCUS_MAX_CHANNELS} 个重点频道",
+            )
+        )
+    else:
+        if len(value) > FOCUS_MAX_CHANNELS:
+            errors.append(
+                InputError(
+                    FOCUS_LINE,
+                    f"重点频道数量超出上限：最多选择 {FOCUS_MAX_CHANNELS} 个，"
+                    f"当前选择 {len(value)} 个",
+                )
+            )
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                errors.append(
+                    InputError(FOCUS_LINE, "重点频道名称缺失或非法：名称应为非空文本")
+                )
+                continue
+            name = item.strip()
+            if name in seen:
+                errors.append(
+                    InputError(
+                        FOCUS_LINE,
+                        f"重点频道「{name}」重复选择，每个频道只能勾选一次",
+                    )
+                )
+                continue
+            seen.add(name)
+            if not any(c.name == name for c in channels):
+                errors.append(
+                    InputError(
+                        FOCUS_LINE,
+                        f"重点频道「{name}」不在当前清单中，"
+                        "请从分析结果关联的频道中勾选",
+                    )
+                )
+                continue
+            names.append(name)
+
+    if errors:
+        return None, errors
+    return names, []
+
+
+def evaluate_focus(
+    conflicts: list[Conflict], focus_names: list[str]
+) -> FocusEvaluation:
+    """从现有冲突结果中筛出与重点频道相关的条目并分级排序。
+
+    只读传入的冲突列表（顶层完整结果），不重新计算、不改写：
+    目标频道即重点频道的记为「直接影响」，仅来源组合含重点频道的记为
+    「来源相关」（目标优先，同一条目不重复计入）；按（关系等级，原有顺序）
+    稳定排列，直接影响整体在前，两类内部各自保持完整结果的原有顺序。
+    """
+    focus = set(focus_names)
+    entries: list[FocusEntry] = []
+    for c in conflicts:
+        if c.target_name in focus:
+            relation = FOCUS_RELATION_DIRECT
+        elif any(x in focus or y in focus for x, y in c.sources):
+            relation = FOCUS_RELATION_SOURCE
+        else:
+            continue
+        entries.append(
+            FocusEntry(
+                relation=relation,
+                target_name=c.target_name,
+                target_freq_khz=c.target_freq_khz,
+                product_khz=c.product_khz,
+                diff_khz=c.diff_khz,
+                sources=list(c.sources),
+            )
+        )
+
+    # Python sort 稳定：仅按关系等级排序即可在两类内部保留原有冲突顺序
+    entries.sort(key=lambda e: 0 if e.relation == FOCUS_RELATION_DIRECT else 1)
+    return FocusEvaluation(names=list(focus_names), entries=entries)

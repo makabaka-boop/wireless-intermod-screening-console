@@ -383,6 +383,86 @@ select:focus {
   font-size: 14px;
 }
 
+.focus-box {
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 12px;
+}
+
+.focus-controls {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.focus-controls h3 {
+  font-size: 15px;
+  margin: 0 8px 0 0;
+}
+
+.focus-option {
+  align-items: center;
+  background: rgba(77, 163, 255, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  display: inline-flex;
+  font-size: 13px;
+  gap: 6px;
+  padding: 6px 10px;
+  white-space: nowrap;
+}
+
+.focus-option input {
+  accent-color: var(--accent);
+  margin: 0;
+  width: auto;
+}
+
+.focus-controls button {
+  margin-top: 0;
+}
+
+.focus-box .hint {
+  margin: 8px 0 0;
+}
+
+.focus-result {
+  margin-top: 10px;
+}
+
+.focus-result h4 {
+  font-size: 14px;
+  margin: 4px 0 8px;
+}
+
+.focus-empty {
+  background: rgba(74, 222, 128, 0.08);
+  border: 1px solid var(--safe);
+  border-radius: 8px;
+  font-size: 14px;
+  margin: 0;
+  padding: 10px 14px;
+}
+
+.tag-direct {
+  background: rgba(255, 107, 107, 0.2);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.tag-source {
+  background: rgba(77, 163, 255, 0.15);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.focus-error-panel h2 {
+  font-size: 14px;
+}
+
 .summary-header {
   align-items: center;
   border-top: 1px solid var(--border);

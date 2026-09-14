@@ -18,12 +18,15 @@ export interface CandidateInput {
  * 提交频道清单进行互调排查。
  * 请求真实后端接口 /api/analyze（开发环境由 vite 代理，生产由 nginx 反代）。
  * candidate 非空时携带候选对象，后端在保留基线结果的同时返回增量评估；
- * retune 非空时携带微调频道名称，后端返回该频道 ±500 kHz 内的替换频点建议。
+ * retune 非空时携带微调频道名称，后端返回该频道 ±500 kHz 内的替换频点建议；
+ * focus 非空时携带一至三个重点频道名称，后端复用现有冲突结果返回聚焦分级，
+ * 完整结果与可复制摘要不因聚焦而改写。
  */
 export async function analyze(
   input: string,
   candidate?: CandidateInput,
   retune?: string,
+  focus?: string[],
 ): Promise<AnalyzeResponse> {
   const payload: Record<string, unknown> = { input };
   if (candidate) {
@@ -31,6 +34,9 @@ export async function analyze(
   }
   if (retune) {
     payload.retune = retune;
+  }
+  if (focus && focus.length > 0) {
+    payload.focus = focus;
   }
   let res: Response;
   try {
